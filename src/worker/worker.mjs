@@ -512,8 +512,10 @@ async function consolidateConversation(item, conversationsSnapshot = null) {
     }
     log(`✓ ${key} 补丁纠错通过`);
   }
-  if (gid && !parsed.timeline.length) {
-    log(`⚠ ${key} 模型没给 timeline（输出 ${String(output).length} 字）`);
+  // 只有确实写了补丁却没有 timeline 时才值得警告；整批空补丁属于模型按约定交白卷。
+  const gavePatches = Boolean(parsed.timeline?.length || parsed.members?.length || parsed.persona);
+  if (gid && gavePatches && !parsed.timeline?.length) {
+    log(`⚠ ${key} 本批有补丁但没有 timeline（输出 ${String(output).length} 字）`);
   }
 
   let applied;
