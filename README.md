@@ -1,5 +1,7 @@
 # DSH_memory
 
+当前版本为 **0.1.1**。发行变化见 [CHANGELOG.md](CHANGELOG.md)。
+
 面向 QQbridge + DeepSeek Harness（DSH）的本地长期记忆插件。它提供一个按需只读的
 `memory_context` 工具，并用独立 worker 将近期聊天整理为群时间线、成员事实和动态人设。
 
@@ -50,7 +52,7 @@ worker 通过版本化适配层复用 QQbridge 的 `src/dsh-client.js` 和 `src/
 ### 1. 获取代码
 
 ```powershell
-git clone https://github.com/Xavier14-aqua/DSH_memory.git DSH_memory
+git clone https://github.com/vvf-eng/DSH_memory.git DSH_memory
 cd DSH_memory
 node --version
 ```
@@ -210,6 +212,11 @@ data/
 QQ/群号和令牌，不要提交 Git 或上传公开 issue。详见 [PRIVACY.md](PRIVACY.md)。
 
 ## 升级与卸载
+
+从 `0.1.0` 升级到 `0.1.1` 时，保留原有 `config.json` 和 `data/`。新增配置项有默认值，
+已有 Schema 3 成员档案可继续读取。旧版全局整理会话状态会由按会话隔离的会话池接替。
+私聊整理默认开启，只整理群聊时可在现有配置中设置 `consolidate.includePrivate=false`。
+本版本的已知限制见 [CHANGELOG.md](CHANGELOG.md)。
 
 升级前停止 worker 并备份数据，然后更新代码、运行测试和诊断。涉及事实 Schema 的版本先执行文档要求的
 `--dry` 迁移。
