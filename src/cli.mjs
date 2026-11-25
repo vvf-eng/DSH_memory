@@ -312,8 +312,9 @@ async function cmdStatus() {
     console.log('成员档：');
     for (const m of members) {
       const gs = Object.keys(m.groups ?? {});
+      const shownName = m.displayName || gs.map((g) => m.groups?.[g]?.alias).find(Boolean) || '';
       const facts = (m.global?.facts?.length ?? 0) + gs.reduce((n, g) => n + (m.groups?.[g]?.facts?.length ?? 0), 0);
-      console.log(`  ${m.qq} ${m.displayName ?? ''}  群 ${gs.join(',') || '-'}  事实 ${facts} 条`);
+      console.log(`  ${m.qq} ${shownName}  群 ${gs.join(',') || '-'}  事实 ${facts} 条`);
     }
   }
 }
@@ -599,8 +600,9 @@ function cmdMemberList() {
     const gs = Object.entries(m.groups ?? {})
       .map(([g, v]) => `${g}(${v?.relation || '未标关系'})`)
       .join(' ');
+    const shownName = m.displayName || Object.values(m.groups ?? {}).map((g) => g?.alias).find(Boolean) || '';
     const facts = (m.global?.facts?.length ?? 0) + Object.values(m.groups ?? {}).reduce((n, g) => n + (g?.facts?.length ?? 0), 0);
-    console.log(`  ${m.qq}  ${m.displayName ?? ''}  事实 ${facts} 条  群：${gs || '-'}`);
+    console.log(`  ${m.qq}  ${shownName}  事实 ${facts} 条  群：${gs || '-'}`);
   }
 }
 
@@ -777,7 +779,7 @@ function cmdMetrics(days = 7) {
   console.log(`匿名运行指标（近 ${span} 天，共 ${records.length} 条）`);
   console.log(`记忆读取：${s.reads.total} 次；成功 ${s.reads.success}，拒绝 ${s.reads.denied}，失败 ${s.reads.failed}`);
   console.log(`  tiny/brief/full=${s.reads.tiny}/${s.reads.brief}/${s.reads.full}；成功平均 ${s.reads.avgChars} 字；裁剪 ${s.reads.truncated} 次；缓存复用 ${s.reads.cached} 次`);
-  console.log(`后台整理：${s.consolidate.total} 次；成功 ${s.consolidate.success}，跳过 ${s.consolidate.skipped}，失败 ${s.consolidate.failed}（解析失败 ${s.consolidate.parseFailed}）`);
+  console.log(`后台整理：${s.consolidate.total} 次；成功 ${s.consolidate.success}，跳过 ${s.consolidate.skipped}，失败 ${s.consolidate.failed}（解析失败 ${s.consolidate.parseFailed}，补丁失败 ${s.consolidate.patchFailed}）`);
   console.log(`  送入整理模型 ${s.consolidate.rawMessages} 条（有效 ${s.consolidate.informativeMessages}）；当前 pending ${s.consolidate.pendingDepth} 条`);
   console.log(`  时间线 +${s.consolidate.timelinePoints}；事实 +${s.consolidate.memberFacts}；日期钳制 ${s.consolidate.dateClamped}`);
   console.log(`  整理会话退役：batch ${s.consolidate.sessionRetired?.batches ?? 0} / step ${s.consolidate.sessionRetired?.steps ?? 0} / token ${s.consolidate.sessionRetired?.tokens ?? 0}`);

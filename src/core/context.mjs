@@ -98,7 +98,7 @@ export function loadMembers(memDir) {
   return out;
 }
 
-function findMember(members, { qq, name }) {
+function findMember(members, { qq, name }, gid = null) {
   const byQQ = members.find((m) => String(m.qq) === String(qq));
   if (byQQ) return byQQ;
   // userId/QQ 是可信身份；存在时绝不能因同名/同群名片回落到另一个人的档案。
@@ -107,7 +107,9 @@ function findMember(members, { qq, name }) {
   return (
     members.find((m) => m.displayName === name) ||
     members.find((m) => Array.isArray(m.aliases) && m.aliases.includes(name)) ||
-    members.find((m) => m.groups && Object.values(m.groups).some((g) => g?.alias === name)) ||
+    (gid
+      ? members.find((m) => m.groups?.[gid]?.alias === name || (Array.isArray(m.groups?.[gid]?.aliases) && m.groups[gid].aliases.includes(name)))
+      : null) ||
     null
   );
 }
@@ -218,8 +220,25 @@ function queryFromMessages(messages) {
     .join(' ');
 }
 
+function groupOldAliasesOf(member, gid) {
+  if (!gid) return [];
+  const group = member?.groups?.[gid];
+  const current = String(group?.alias ?? '').trim();
+  const out = [];
+  for (const raw of Array.isArray(group?.aliases) ? group.aliases : []) {
+    const name = String(raw ?? '').trim();
+    if (name && name !== current && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 function aliasesOf(member, gid) {
-  return [member?.displayName, ...(Array.isArray(member?.aliases) ? member.aliases : []), gid && member?.groups?.[gid]?.alias]
+  return [
+    member?.displayName,
+    ...(Array.isArray(member?.aliases) ? member.aliases : []),
+    gid && member?.groups?.[gid]?.alias,
+    ...groupOldAliasesOf(member, gid)
+  ]
     .map((s) => String(s ?? '').trim()).filter(Boolean);
 }
 
@@ -285,7 +304,7 @@ export function buildContext({
   const members = loadMembers(memDir);
   const lastIncoming = [...allMessages].reverse().find((m) => m && !m.isSelf);
   const speaker = lastIncoming ? { name: String(lastIncoming.sender ?? ''), qq: String(lastIncoming.userId ?? '') } : null;
-  const speakerMember = speaker ? findMember(members, { qq: speaker.qq, name: speaker.name }) : null;
+  const speakerMember = speaker ? findMember(members, { qq: speaker.qq, name: speaker.name }, gid) : null;
   const mentionPool = gid ? members.filter((member) => member?.groups?.[gid]) : members;
   const mentioned = mentionedMemberIds(mentionPool, effectiveQuery, gid);
   const allowedIds = new Set(mentioned);
@@ -319,10 +338,20 @@ export function buildContext({
     const memberId = String(member?.qq ?? '');
     if (!allowedIds.has(memberId)) continue;
     const aliases = aliasesOf(member, gid);
-    const label = member?.groups?.[gid]?.alias || member?.displayName || aliases[0] || '成员';
+    const groupOldAliases = groupOldAliasesOf(member, gid);
+    const label = (gid && member?.groups?.[gid]?.alias)
+      || member?.displayName
+      || aliases[0]
+      || (speaker?.qq === memberId && speaker?.name ? speaker.name : '')
+      || '成员';
     const relation = gid ? String(member?.groups?.[gid]?.relation ?? '') : '';
     const tags = (Array.isArray(member?.global?.tags) ? member.global.tags : []).slice(0, 4).map(String);
-    const profileBits = [relation && `关系：${relation}`, tags.length && `标签：${tags.join('、')}`, member?.owner === true && '管理员本人'].filter(Boolean);
+    const profileBits = [
+      relation && `关系：${relation}`,
+      groupOldAliases.length && `旧称：${groupOldAliases.slice(0, 3).join('、')}`,
+      tags.length && `标签：${tags.join('、')}`,
+      member?.owner === true && '管理员本人'
+    ].filter(Boolean);
     if (profileBits.length) candidates.push({ type: relation ? 'relationship' : 'member', text: profileBits.join('｜'), label, memberId, aliases, relation, scope: gid ? 'group' : 'global', groupId: gid, importance: 0.8, confidence: 1 });
     for (const fact of scopedFacts(member, gid)) {
       const relationship = /关系|吵架|和好|冷战|朋友|熟人|对象|同学|同事/.test(String(fact.text ?? ''));

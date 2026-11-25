@@ -358,6 +358,8 @@ function writeDynamicPersona(memDir, persona, now, backupStamp) {
   return { updated: true, before, after };
 }
 
+const GROUP_ALIAS_LIMIT = 10;
+
 /** 统计每个 QQ 在这批消息里说了多少条（不算机器人自己）。 */
 function countByAuthor(messages) {
   const counts = new Map();
@@ -368,6 +370,87 @@ function countByAuthor(messages) {
     counts.set(qq, (counts.get(qq) ?? 0) + 1);
   }
   return counts;
+}
+
+/** 按消息顺序提取每个 QQ 在本批消息中出现过的有效群名片。 */
+function collectGroupSenders(messages) {
+  const byQq = new Map();
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m || m.isSelf) continue;
+    const qq = String(m.userId ?? '').trim();
+    if (!/^\d{4,12}$/.test(qq)) continue;
+    const name = clip(m.sender, 40);
+    if (!name || name === '?' || name === qq) continue;
+    let list = byQq.get(qq);
+    if (!list) {
+      list = [];
+      byQq.set(qq, list);
+    }
+    if (list[list.length - 1] !== name) list.push(name);
+  }
+  return byQq;
+}
+
+function ensureGroupProfile(obj, gid, now) {
+  obj.groups = obj.groups ?? {};
+  const g = (obj.groups[gid] = obj.groups[gid] ?? {
+    alias: '',
+    aliases: [],
+    relation: '',
+    firstSeen: dateOf(now),
+    lastSeen: dateOf(now),
+    interactions: 0,
+    facts: []
+  });
+  g.facts = Array.isArray(g.facts) ? g.facts : [];
+  return g;
+}
+
+/** 更新本群当前群名片，并将被替换的旧名仅留在本群 aliases 中（绝不写入全局 displayName/aliases）。 */
+function applyGroupAliases(groupObj, names = [], qq = '') {
+  if (!groupObj || typeof groupObj !== 'object') return false;
+  let changed = false;
+  let current = clip(groupObj.alias, 40);
+  if (current === qq || current === '?') current = '';
+  const hadAliases = Array.isArray(groupObj.aliases);
+  const history = [];
+  for (const raw of hadAliases ? groupObj.aliases : []) {
+    const item = clip(raw, 40);
+    if (item && item !== '?' && item !== qq && item !== current && !history.includes(item)) history.push(item);
+  }
+  for (const raw of names) {
+    const next = clip(raw, 40);
+    if (!next || next === '?' || next === qq) continue;
+    if (!current) {
+      current = next;
+      const idx = history.indexOf(next);
+      if (idx >= 0) history.splice(idx, 1);
+      changed = true;
+      continue;
+    }
+    if (next === current) continue;
+    if (!history.includes(current)) history.unshift(current);
+    const idx = history.indexOf(next);
+    if (idx >= 0) history.splice(idx, 1);
+    current = next;
+    changed = true;
+  }
+  if (history.length > GROUP_ALIAS_LIMIT) {
+    history.length = GROUP_ALIAS_LIMIT;
+    changed = true;
+  }
+  if ((groupObj.alias ?? '') !== current) {
+    groupObj.alias = current;
+    changed = true;
+  }
+  if (history.length > 0 || hadAliases) {
+    const same = hadAliases && groupObj.aliases.length === history.length && groupObj.aliases.every((v, i) => v === history[i]);
+    if (!same) {
+      groupObj.aliases = history;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 const auditDir = (memDir) => path.join(memDir, '.state', 'audit');
@@ -407,6 +490,7 @@ function applyConsolidationUnsafe({ memDir, key, gid, output, messages = [], now
   const members = Array.isArray(output?.members) ? output.members : [];
   const persona = output?.persona ?? null;
   const counts = countByAuthor(messages);
+  const sendersByQq = collectGroupSenders(messages);
   const audit = {
     schema: 1,
     id: `${stamp}-${gid}`,
@@ -465,17 +549,7 @@ function applyConsolidationUnsafe({ memDir, key, gid, output, messages = [], now
     handled.add(qq);
     let touched = false;
     for (const fact of entry.facts) {
-      const bucket =
-        fact.scope === 'global'
-          ? obj.global.facts
-          : (obj.groups[gid] = obj.groups[gid] ?? {
-              alias: '',
-              relation: '',
-              firstSeen: dateOf(now),
-              lastSeen: dateOf(now),
-              interactions: 0,
-              facts: []
-            }).facts ?? (obj.groups[gid].facts = []);
+      const bucket = fact.scope === 'global' ? obj.global.facts : ensureGroupProfile(obj, gid, now).facts;
       if (bucket.some((f) => String(f?.text ?? '') === fact.text)) continue;
       const id = `a-${dateOf(now).replace(/-/g, '')}-${fact.scope}-${String(bucket.length + 1).padStart(2, '0')}`;
       bucket.unshift(createFactRecord({
@@ -496,35 +570,37 @@ function applyConsolidationUnsafe({ memDir, key, gid, output, messages = [], now
       memberFacts += 1;
       touched = true;
     }
-    if (entry.alias) {
-      const g = (obj.groups[gid] = obj.groups[gid] ?? { relation: '', firstSeen: dateOf(now), lastSeen: dateOf(now), interactions: 0, facts: [] });
-      if (!g.alias) g.alias = entry.alias;
-      if (!obj.displayName) obj.displayName = entry.alias;
-      touched = true;
+    const candidateNames = [...(sendersByQq.get(qq) ?? [])];
+    if (entry.alias && candidateNames[candidateNames.length - 1] !== clip(entry.alias, 40)) {
+      candidateNames.push(clip(entry.alias, 40));
+    }
+    if (gid && candidateNames.length) {
+      const g = ensureGroupProfile(obj, gid, now);
+      if (applyGroupAliases(g, candidateNames, qq)) touched = true;
     }
     const delta = counts.get(qq) ?? 0;
-    if (delta > 0) {
-      const g = (obj.groups[gid] = obj.groups[gid] ?? { relation: '', firstSeen: dateOf(now), lastSeen: dateOf(now), interactions: 0, facts: [] });
+    if (gid && delta > 0) {
+      const g = ensureGroupProfile(obj, gid, now);
       g.interactions = (Number(g.interactions) || 0) + delta;
       audit.interactions[qq] = delta;
       interactionsBumped += delta;
       touched = true;
     }
     if (touched) {
-      if (obj.groups[gid]) obj.groups[gid].lastSeen = dateOf(now);
+      if (gid && obj.groups[gid]) obj.groups[gid].lastSeen = dateOf(now);
       backupOnce(memDir, file, stamp);
       atomicWriteText(file, JSON.stringify(obj, null, 2) + '\n');
     }
   }
 
-  // 只统计活跃度、没进整理结果的人：已经有档的才累加，不新建空档。
+  // 只统计活跃度、没进整理结果的人：已经有档的才累加并同步本群名片，不新建空档。
   for (const [qq, delta] of counts) {
-    if (handled.has(qq)) continue;
+    if (handled.has(qq) || !gid) continue;
     const file = path.join(memDir, 'members', `${qq}.json`);
     const obj = readJson(file, null);
     if (!obj) continue;
-    obj.groups = obj.groups ?? {};
-    const g = (obj.groups[gid] = obj.groups[gid] ?? { relation: '', firstSeen: dateOf(now), lastSeen: dateOf(now), interactions: 0, facts: [] });
+    const g = ensureGroupProfile(obj, gid, now);
+    applyGroupAliases(g, sendersByQq.get(qq) ?? [], qq);
     g.interactions = (Number(g.interactions) || 0) + delta;
     g.lastSeen = dateOf(now);
     audit.interactions[qq] = delta;

@@ -5,6 +5,29 @@ import path from 'node:path';
 
 const DEFAULTS = Object.freeze({ enabled: true, maxBytes: 5 * 1024 * 1024, keepFiles: 5 });
 const METRIC_TYPES = new Set(['memory-read', 'consolidate']);
+const CONSOLIDATE_REASONS = new Set([
+  'ok',
+  'too-few',
+  'no-visible-message',
+  'no-informative',
+  'pending-too-few',
+  'waiting-min-informative',
+  'waiting-max-wait',
+  'waiting-quiet',
+  'source-unavailable',
+  'session-unavailable',
+  'prompt-rejected',
+  'parse-failed',
+  'repair-prompt-rejected',
+  'patch-invalid',
+  'exception'
+]);
+
+const MODEL_CONSUMED_FAILURE_REASONS = new Set([
+  'parse-failed',
+  'repair-prompt-rejected',
+  'patch-invalid'
+]);
 
 function optionsOf(options = {}) {
   return {
@@ -83,8 +106,7 @@ function sanitize(event) {
   const usage = event.usage && typeof event.usage === 'object' ? event.usage : {};
   return {
     ...base,
-    reason: ['ok', 'too-few', 'no-visible-message', 'no-informative', 'pending-too-few', 'waiting-min-informative', 'waiting-max-wait', 'waiting-quiet', 'source-unavailable', 'session-unavailable', 'prompt-rejected', 'parse-failed', 'exception'].includes(event.reason)
-      ? event.reason : 'exception',
+    reason: CONSOLIDATE_REASONS.has(event.reason) ? event.reason : 'exception',
     rawMessages: finiteInt(event.rawMessages),
     informativeMessages: finiteInt(event.informativeMessages),
     pendingDepth: finiteInt(event.pendingDepth),
@@ -164,6 +186,7 @@ export function summarizeMetrics(records) {
   const sum = (arr, pick) => arr.reduce((n, row) => n + finiteInt(pick(row)), 0);
   const successfulReads = reads.filter((r) => r.status === 'success');
   const successfulJobs = jobs.filter((r) => r.status === 'success');
+  const consumedJobs = jobs.filter((r) => r.status === 'success' || MODEL_CONSUMED_FAILURE_REASONS.has(r.reason));
   const latestJob = jobs.reduce((latest, row) => Date.parse(row.at) > Date.parse(latest?.at ?? 0) ? row : latest, null);
   const usage = {
     cacheMiss: sum(jobs, (r) => r.usage?.cacheMiss),
@@ -191,9 +214,11 @@ export function summarizeMetrics(records) {
       skipped: jobs.filter((r) => r.status === 'skipped').length,
       failed: jobs.filter((r) => r.status === 'failed').length,
       parseFailed: jobs.filter((r) => r.reason === 'parse-failed').length,
-      // too-few 会在每次轮询重复看见同一批候选消息，不能把它们反复算成模型输入。
-      rawMessages: sum(jobs.filter((r) => r.status === 'success' || r.reason === 'parse-failed'), (r) => r.rawMessages),
-      informativeMessages: sum(jobs.filter((r) => r.status === 'success' || r.reason === 'parse-failed'), (r) => r.informativeMessages),
+      patchFailed: jobs.filter((r) => r.reason === 'patch-invalid' || r.reason === 'repair-prompt-rejected').length,
+      // too-few 等跳过或未送入模型的错误会在每次轮询重复看见同一批候选消息，不能反复算成模型输入；
+      // 但已实际执行过整理回合的失败批次（解析失败、补丁纠错被拒、补丁校验仍失败）必须计入输入条数。
+      rawMessages: sum(consumedJobs, (r) => r.rawMessages),
+      informativeMessages: sum(consumedJobs, (r) => r.informativeMessages),
       pendingDepth: finiteInt(latestJob?.pendingDepth),
       timelinePoints: sum(successfulJobs, (r) => r.timelinePoints),
       memberFacts: sum(successfulJobs, (r) => r.memberFacts),

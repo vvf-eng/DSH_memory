@@ -20,11 +20,13 @@ const INTENT_PATTERNS = [
 // 规则之前判定，否则私聊没有 timeline 候选时会把本人的全部事实过滤掉。
 const SELF_MEMORY_MEMBER = /(?:还?记得我(?:什么|哪些|多少|吗)?|对我(?:有)?什么印象|对我的印象|了解我(?:什么|多少)?|关于我(?:知道|记得)?什么|去(?:记忆)?库里(?:翻|查|看)|翻翻(?:记忆)?库)/;
 
+const OLD_ALIAS_MEMBER = /旧称|曾用名|旧名|(?:以前|之前|原来)叫什么/;
+
 export function inferIntent(query, requested = 'auto') {
   const explicit = String(requested ?? 'auto').toLowerCase();
   if (INTENTS.includes(explicit) && explicit !== 'auto') return explicit;
   const text = String(query ?? '').trim();
-  if (SELF_MEMORY_MEMBER.test(text)) return 'member';
+  if (SELF_MEMORY_MEMBER.test(text) || OLD_ALIAS_MEMBER.test(text)) return 'member';
   for (const [intent, re] of INTENT_PATTERNS) if (re.test(text)) return intent;
   return 'general';
 }
@@ -48,11 +50,13 @@ export function extractTerms(value) {
 }
 
 function aliasesOf(member, gid) {
+  const group = gid ? member?.groups?.[gid] : null;
   return [
     String(member?.qq ?? ''),
     String(member?.displayName ?? ''),
     ...(Array.isArray(member?.aliases) ? member.aliases.map(String) : []),
-    String(gid && member?.groups?.[gid]?.alias || '')
+    String(group?.alias ?? ''),
+    ...(Array.isArray(group?.aliases) ? group.aliases.map(String) : [])
   ].map((s) => s.trim()).filter(Boolean);
 }
 

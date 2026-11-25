@@ -494,6 +494,118 @@ check('整理会话：累计批次/step/token', budget.batches === 4 && budget.s
 check('整理会话：任一预算命中即退役', sessionRetirementReason(budget, { maxBatches: 4, maxSteps: 12, maxTokens: 100000 }) === 'batches');
 fs.rmSync(usageRoot, { recursive: true, force: true });
 
+// ── 18. 群名片回填/本群旧名隔离 + 补丁失败指标统计 ──────────────────────────
+const newMemberMsgs1 = [
+  { seq: 50, sender: '初号机', userId: '5555555555', text: '我平时喜欢拼模型', time: Date.now() - 20_000, isSelf: false }
+];
+const newMemberPatch1 = parseConsolidationOutput(JSON.stringify({
+  schema: 1,
+  patches: [
+    { op: 'add', target: 'member-fact', qq: '5555555555', scope: 'global', value: { text: '喜欢拼模型', confidence: 0.9, sourceSeq: 50 } }
+  ]
+}));
+applyConsolidation({ memDir: root, key: 'group:1234567890', gid: '1234567890', output: newMemberPatch1, messages: newMemberMsgs1 });
+const createdMember = JSON.parse(fs.readFileSync(path.join(root, 'members', '5555555555.json'), 'utf8'));
+check(
+  '群名片：新建成员写入本群 alias 且不污染全局 displayName/aliases',
+  createdMember.groups?.['1234567890']?.alias === '初号机'
+  && createdMember.displayName === ''
+  && Array.isArray(createdMember.aliases) && createdMember.aliases.length === 0
+);
+const askByNewCard = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '初号机喜欢什么',
+  intent: 'member',
+  detail: 'brief',
+  messages: [{ seq: 51, sender: '小乙', userId: '2222222222', text: '初号机喜欢什么', time: Date.now() - 15_000, isSelf: false }]
+});
+check('群名片：新建成员可按群名片点名召回并显示名称', askByNewCard.text.includes('· 初号机：喜欢拼模型'), askByNewCard.text);
+
+const renameMsgs = [
+  { seq: 52, sender: '二号机', userId: '5555555555', text: '我改个群名片冒泡', time: Date.now() - 10_000, isSelf: false }
+];
+const emptyPatch = parseConsolidationOutput(JSON.stringify({ schema: 1, patches: [] }));
+applyConsolidation({ memDir: root, key: 'group:1234567890', gid: '1234567890', output: emptyPatch, messages: renameMsgs, now: Date.now() + 5_000 });
+const renamedMember = JSON.parse(fs.readFileSync(path.join(root, 'members', '5555555555.json'), 'utf8'));
+check(
+  '群名片：改名后旧名仅保留在本群 aliases',
+  renamedMember.groups?.['1234567890']?.alias === '二号机'
+  && Array.isArray(renamedMember.groups?.['1234567890']?.aliases)
+  && renamedMember.groups['1234567890'].aliases.includes('初号机')
+  && renamedMember.displayName === ''
+  && renamedMember.aliases.length === 0
+);
+const askByOldCard = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '初号机喜欢什么',
+  intent: 'member',
+  detail: 'brief',
+  messages: [{ seq: 53, sender: '小乙', userId: '2222222222', text: '初号机喜欢什么', time: Date.now() - 8_000, isSelf: false }]
+});
+check('本群旧称：用旧群名片提问仍能召回该成员', askByOldCard.text.includes('二号机') && askByOldCard.text.includes('喜欢拼模型'), askByOldCard.text);
+const askOldAlias = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '二号机以前叫什么',
+  intent: 'auto',
+  detail: 'brief',
+  messages: [{ seq: 54, sender: '小乙', userId: '2222222222', text: '二号机以前叫什么', time: Date.now() - 6_000, isSelf: false }]
+});
+check('本群旧称：询问以前叫什么归 member 并返回旧称', askOldAlias.retrieval.intent === 'member' && askOldAlias.text.includes('旧称：初号机'), askOldAlias.text);
+
+applyConsolidation({
+  memDir: root,
+  key: 'group:888',
+  gid: '888',
+  output: parseConsolidationOutput(JSON.stringify({
+    schema: 1,
+    patches: [{ op: 'add', target: 'timeline', date: new Date().toISOString().slice(0, 10), value: { text: '路人五在群里签到' } }]
+  })),
+  messages: [{ seq: 1, sender: '路人五', userId: '5555555555', text: '大家好', time: Date.now() - 5_000, isSelf: false }],
+  now: Date.now() + 10_000
+});
+const crossGroupOldName = buildContext({
+  memDir: root,
+  key: 'group:888',
+  query: '初号机喜欢什么',
+  intent: 'member',
+  detail: 'full',
+  messages: [{ seq: 2, sender: '外群人', userId: '3333333333', text: '初号机喜欢什么', time: Date.now() - 3_000, isSelf: false }]
+});
+check('隔离：他群不可通过原群旧名或名片反查成员', !crossGroupOldName.text.includes('喜欢拼模型') && !crossGroupOldName.text.includes('初号机') && !crossGroupOldName.text.includes('二号机'), crossGroupOldName.text);
+const privateNoGroupAlias = buildContext({
+  memDir: root,
+  key: 'private:5555555555',
+  query: '你还记得我什么',
+  intent: 'auto',
+  detail: 'full',
+  messages: [{ seq: 1, sender: '五号私聊', userId: '5555555555', text: '你还记得我什么', time: Date.now() - 2_000, isSelf: false }]
+});
+check('隔离：私聊不暴露任何群名片或群旧称', privateNoGroupAlias.text.includes('喜欢拼模型') && !privateNoGroupAlias.text.includes('初号机') && !privateNoGroupAlias.text.includes('二号机'), privateNoGroupAlias.text);
+
+const patchMetricRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-patch-metrics-'));
+const patchConv = anonymizeConversation(patchMetricRoot, 'group:1234567890');
+appendMetric(patchMetricRoot, { type: 'consolidate', conversation: patchConv, status: 'failed', reason: 'patch-invalid', rawMessages: 30, informativeMessages: 28 });
+appendMetric(patchMetricRoot, { type: 'consolidate', conversation: patchConv, status: 'failed', reason: 'repair-prompt-rejected', rawMessages: 15, informativeMessages: 14 });
+appendMetric(patchMetricRoot, { type: 'consolidate', conversation: patchConv, status: 'failed', reason: 'prompt-rejected', rawMessages: 20, informativeMessages: 20 });
+appendMetric(patchMetricRoot, { type: 'consolidate', conversation: patchConv, status: 'skipped', reason: 'waiting-quiet', rawMessages: 0, informativeMessages: 30 });
+const patchMetricRows = readMetrics(patchMetricRoot, { days: 1 });
+check(
+  '指标：保留 patch-invalid 与 repair-prompt-rejected 原因',
+  patchMetricRows.some((r) => r.reason === 'patch-invalid') && patchMetricRows.some((r) => r.reason === 'repair-prompt-rejected')
+);
+const patchMetricSummary = summarizeMetrics(patchMetricRows);
+check(
+  '指标：两种补丁失败计入模型输入条数且排除未执行回合的失败/跳过',
+  patchMetricSummary.consolidate.patchFailed === 2
+  && patchMetricSummary.consolidate.rawMessages === 45
+  && patchMetricSummary.consolidate.informativeMessages === 42,
+  JSON.stringify(patchMetricSummary.consolidate)
+);
+fs.rmSync(patchMetricRoot, { recursive: true, force: true });
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
