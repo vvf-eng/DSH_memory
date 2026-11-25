@@ -17,21 +17,31 @@ import {
   failPendingBatch,
   pendingBatch,
   pendingQueueFile,
+  readDeadLetters,
   readPendingQueue,
   scanIntoPending
 } from '../src/core/pending.mjs';
 import { classifyMessage } from '../src/worker/filter.mjs';
 import { evaluatePendingTrigger } from '../src/core/batching.mjs';
-import { inferIntent } from '../src/core/retrieval.mjs';
+import { extractDateRange, inferIntent } from '../src/core/retrieval.mjs';
 import { validatePatchEnvelope } from '../src/core/patches.mjs';
 import { prepareTransaction, readTransaction, recoverPreparedTransactions } from '../src/core/transaction.mjs';
 import { createFactRecord, migrateMembersToSchema3, normalizeFact } from '../src/core/facts.mjs';
 import { analyzeToolUsage, applyToolPrunePlan } from '../src/core/tool-usage.mjs';
-import { nextSessionBudget, sessionRetirementReason } from '../src/core/session-budget.mjs';
+import {
+  getScopedSession,
+  nextSessionBudget,
+  normalizeConsolidationPool,
+  sessionRetirementReason,
+  setScopedSession
+} from '../src/core/session-budget.mjs';
+import { loadSocialSnapshot, readMessages } from '../src/source/social-v2.mjs';
 import {
   applyConsolidation,
   buildConsolidationPrompt,
   buildConsolidationRepairPrompt,
+  fitMessagesToPromptBudget,
+  pruneStateHistory,
   rollbackAudit,
   parseConsolidationOutput,
   dedupeMemberFacts,
@@ -605,6 +615,297 @@ check(
   JSON.stringify(patchMetricSummary.consolidate)
 );
 fs.rmSync(patchMetricRoot, { recursive: true, force: true });
+
+// ── 19. 全量增强回归（防吞消息 / 跨群回滚 / 退避死信 / 短回复引用 / 旧事实闭环 / 分词指代泛查 / 私聊与人设隔离 / 会话池）──
+const budgetKey = 'group:909090';
+const longMessages = Array.from({ length: 20 }, (_, i) => ({
+  seq: i + 1,
+  sender: '刷屏王',
+  userId: '7777777777',
+  text: `第${i + 1}条较长的有效聊天内容，用于验证字符预算前置裁剪不会静默丢失尾部消息`,
+  time: 100_000 + i * 1000,
+  isSelf: false
+}));
+scanIntoPending({ memDir: root, key: budgetKey, messages: longMessages, now: 200_000 });
+const budgetedBatch = beginPendingBatch({ memDir: root, key: budgetKey, maxMessages: 100, maxChars: 550, now: 201_000 });
+const expectedFit = fitMessagesToPromptBudget(longMessages, { maxChars: 550 });
+check(
+  '防吞消息：beginPendingBatch 按 maxChars 裁剪且与 prompt 对齐',
+  budgetedBatch.items.length > 0 && budgetedBatch.items.length < 20 && budgetedBatch.items.length === expectedFit.length,
+  `${budgetedBatch.items.length}/20`
+);
+const afterBudgetCommit = commitPendingBatch({ memDir: root, key: budgetKey, batchId: budgetedBatch.batchId, now: 202_000 });
+check('防吞消息：超出 prompt 预算的尾部消息留在 pending 等下一批', afterBudgetCommit.queue.pending.length === 20 - expectedFit.length);
+
+// 跨群独立游标精确回滚 + 同群后续修改后的逻辑回滚兜底 + GC
+const rbGroupAMsgs = [{ seq: 80, sender: '甲', userId: '1111111111', text: '准备学摄影', time: Date.now() - 40_000, isSelf: false }];
+const rbGroupAPatch = parseConsolidationOutput(JSON.stringify({
+  schema: 1,
+  patches: [{ op: 'add', target: 'member-fact', qq: '1111111111', scope: 'group', groupId: '1234567890', value: { text: '准备学摄影', confidence: 0.85, sourceSeq: 80 } }]
+}));
+const auditCrossA = applyConsolidation({ memDir: root, key: 'group:1234567890', gid: '1234567890', output: rbGroupAPatch, messages: rbGroupAMsgs, now: Date.now() + 20_000 });
+applyConsolidation({
+  memDir: root,
+  key: 'group:888',
+  gid: '888',
+  output: parseConsolidationOutput(JSON.stringify({ schema: 1, patches: [{ op: 'add', target: 'timeline', date: new Date().toISOString().slice(0, 10), value: { text: '888群独立事件' } }] })),
+  messages: [{ seq: 10, sender: '外群人', userId: '3333333333', text: '888群独立发言', time: Date.now() - 30_000, isSelf: false }],
+  now: Date.now() + 25_000
+});
+const rbCrossRes = rollbackAudit({ memDir: root, id: auditCrossA.auditId });
+check('独立游标：其他群整理后本群仍可执行精确事务回滚', rbCrossRes.ok === true && rbCrossRes.exact === true);
+
+const batch1Same = applyConsolidation({
+  memDir: root,
+  key: 'group:1234567890',
+  gid: '1234567890',
+  output: parseConsolidationOutput(JSON.stringify({
+    schema: 1,
+    patches: [{ op: 'add', target: 'member-fact', qq: '1111111111', scope: 'group', groupId: '1234567890', value: { text: '误记的旧批次事实', confidence: 0.7, sourceSeq: 80 } }]
+  })),
+  messages: rbGroupAMsgs,
+  now: Date.now() + 30_000
+});
+applyConsolidation({
+  memDir: root,
+  key: 'group:1234567890',
+  gid: '1234567890',
+  output: parseConsolidationOutput(JSON.stringify({
+    schema: 1,
+    patches: [{ op: 'add', target: 'member-fact', qq: '1111111111', scope: 'group', groupId: '1234567890', value: { text: '后续批次的新事实应保留', confidence: 0.9, sourceSeq: 81 } }]
+  })),
+  messages: [{ seq: 81, sender: '甲', userId: '1111111111', text: '后续批次的新事实应保留', time: Date.now() - 20_000, isSelf: false }],
+  now: Date.now() + 35_000
+});
+const rbLogical = rollbackAudit({ memDir: root, id: batch1Same.auditId });
+const mAfterLogical = JSON.parse(fs.readFileSync(path.join(root, 'members', '1111111111.json'), 'utf8'));
+const gFactsTexts = mAfterLogical.groups['1234567890'].facts.map((f) => f.text);
+check(
+  '逻辑回滚：同群后续批次修改文件后仍可精确剔除目标批次事实且保留新批次',
+  rbLogical.ok === true && rbLogical.fallback === 'logical' && !gFactsTexts.includes('误记的旧批次事实') && gFactsTexts.includes('后续批次的新事实应保留')
+);
+
+const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-gc-'));
+const oldTs = Date.now() - 40 * 86_400_000;
+fs.mkdirSync(path.join(gcRoot, '.backups'), { recursive: true });
+const oldBak = path.join(gcRoot, '.backups', 'old.bak');
+fs.writeFileSync(oldBak, 'old-backup', 'utf8');
+fs.utimesSync(oldBak, new Date(oldTs), new Date(oldTs));
+fs.mkdirSync(path.join(gcRoot, '.state', 'transactions'), { recursive: true });
+fs.writeFileSync(path.join(gcRoot, '.state', 'transactions', '20260101-000000-1.json'), JSON.stringify({ id: 'old-tx', status: 'committed', committedAt: oldTs, files: [] }), 'utf8');
+fs.writeFileSync(path.join(gcRoot, '.state', 'transactions', '20260101-000001-1.json'), JSON.stringify({ id: 'prep-tx', status: 'prepared', preparedAt: oldTs, files: [] }), 'utf8');
+fs.writeFileSync(path.join(gcRoot, '.state', 'transactions', '20261125-000000-1.json'), JSON.stringify({ id: 'recent-tx', status: 'committed', committedAt: Date.now(), files: [] }), 'utf8');
+fs.mkdirSync(path.join(gcRoot, '.state', 'audit'), { recursive: true });
+fs.writeFileSync(path.join(gcRoot, '.state', 'audit', '20260101-000000-1.json'), JSON.stringify({ id: 'old-audit', at: oldTs, files: [{ before: { text: 'big' }, after: { text: 'big2' } }], facts: [{ id: 'f1' }] }), 'utf8');
+fs.writeFileSync(path.join(gcRoot, '.state', 'audit', '20261125-000000-1.json'), JSON.stringify({ id: 'new-audit', at: Date.now(), files: [{ before: { text: 'keep' }, after: { text: 'keep' } }] }), 'utf8');
+const gcRes = pruneStateHistory({ memDir: gcRoot, days: 30, keepLatest: 1, dry: false });
+const compactedAudit = JSON.parse(fs.readFileSync(path.join(gcRoot, '.state', 'audit', '20260101-000000-1.json'), 'utf8'));
+check(
+  'GC 清理：删除超期备份与已完成事务、压缩旧审计快照且保护 prepared 事务',
+  gcRes.backupsRemoved === 1
+  && gcRes.transactionsRemoved === 1
+  && gcRes.auditsCompacted === 1
+  && fs.existsSync(path.join(gcRoot, '.state', 'transactions', '20260101-000001-1.json'))
+  && !('files' in compactedAudit)
+  && compactedAudit.facts.length === 1
+);
+fs.rmSync(gcRoot, { recursive: true, force: true });
+
+// 失败指数退避与毒丸死信隔离
+const poisonKey = 'group:717171';
+scanIntoPending({
+  memDir: root,
+  key: poisonKey,
+  messages: Array.from({ length: 30 }, (_, i) => ({ seq: i + 1, sender: '甲', userId: '1111111111', text: `毒丸测试消息${i + 1}`, time: 1_000, isSelf: false })),
+  now: 10_000
+});
+const pBatch1 = beginPendingBatch({ memDir: root, key: poisonKey, maxMessages: 30, now: 920_000 });
+const afterFail1 = failPendingBatch({ memDir: root, key: poisonKey, batchId: pBatch1.batchId, reason: 'patch-invalid', maxAttempts: 2, now: 925_000 });
+const backoffCheck = evaluatePendingTrigger(afterFail1, { ...adaptiveCfg, retryBaseMs: 300_000 }, 1_000_000);
+const backoffReady = evaluatePendingTrigger(afterFail1, { ...adaptiveCfg, retryBaseMs: 300_000 }, 1_230_000);
+check('失败退避：退避窗口内跳过重试，到期后恢复就绪', backoffCheck.ready === false && backoffCheck.reason === 'retry-backoff' && backoffReady.ready === true && backoffReady.trigger === 'quiet');
+const pBatch2 = beginPendingBatch({ memDir: root, key: poisonKey, maxMessages: 30, now: 1_231_000 });
+const afterFail2 = failPendingBatch({ memDir: root, key: poisonKey, batchId: pBatch2.batchId, reason: 'patch-invalid', maxAttempts: 2, now: 1_235_000 });
+const deadLetters = readDeadLetters(root, poisonKey);
+check('死信隔离：达到最大尝试次数自动转入 dead-letter 并清空阻塞', afterFail2.pending.length === 0 && afterFail2.failures.count === 0 && deadLetters.length === 1 && deadLetters[0].count === 30);
+
+// 问答上下文短回复保留 & 引用透传
+check(
+  '过滤上下文：紧随提问的短确认保留为 normal，独立短确认仍为 low',
+  classifyMessage({ userId: '2', text: '对', time: 20_000 }, { previous: { userId: '1', text: '你确定下周搬去杭州吗？', time: 15_000 } }).level === 'normal'
+  && classifyMessage({ userId: '2', text: '对', time: 20_000 }).level === 'low'
+);
+const quoteKey = 'group:616161';
+const quoteScan = scanIntoPending({
+  memDir: root,
+  key: quoteKey,
+  messages: [{ seq: 1, sender: '乙', userId: '2222222222', text: '是的', replyTo: { seq: 9, sender: '甲', text: '你养猫吗' }, time: 50_000, isSelf: false }],
+  now: 51_000
+});
+const quotePrompt = buildConsolidationPrompt({ groupName: '引用群', key: quoteKey, messages: quoteScan.queue.pending });
+check('引用透传：带 replyTo 的短回复保留并在 prompt 渲染引用上下文', quoteScan.queue.pending.length === 1 && quotePrompt.includes('(回复#9 甲:"你养猫吗") 是的'));
+
+// 旧事实 replace/remove 闭环校验 + 60 条智能淘汰
+const promptWithExisting = buildConsolidationPrompt({
+  groupName: '测试群',
+  key: 'group:1234567890',
+  messages: [{ seq: 90, sender: '甲', userId: '1111111111', text: '我现在改喜欢游泳了', time: Date.now(), isSelf: false }],
+  memDir: root
+});
+check(
+  '旧事实闭环：整理 prompt 仅注入当前发言人在本作用域内的活跃事实 ID 且不泄露他群事实',
+  promptWithExisting.includes('1111111111=>[') && promptWithExisting.includes('global:') && !promptWithExisting.includes('别的群的秘密') && !promptWithExisting.includes('2222222222=>')
+);
+const absentSpeakerReplace = validatePatchEnvelope(
+  { schema: 1, patches: [{ op: 'replace', target: 'member-fact', qq: '2222222222', scope: 'group', groupId: '1234567890', id: 'b1', value: { text: '其实不怕猫了' } }] },
+  { memDir: root, key: 'group:1234567890', gid: '1234567890', messages: [{ seq: 90, sender: '甲', userId: '1111111111', text: '小乙其实不怕猫了', time: Date.now(), isSelf: false }] }
+);
+check('旧事实防篡改：成员未在本批发言时拒绝他人触发的 replace/remove', absentSpeakerReplace.ok === false && absentSpeakerReplace.errors.some((e) => e.includes('未在本批消息发言')));
+
+const evictMsgs = Array.from({ length: 65 }, (_, i) => ({ seq: 200 + i, sender: '容测', userId: '6868686868', text: `事实消息${i}`, time: Date.now() - 1000, isSelf: false }));
+const evictPatches = [
+  { op: 'add', target: 'member-fact', qq: '6868686868', scope: 'group', groupId: '1234567890', value: { text: '高置信核心职业事实', confidence: 0.98, sourceSeq: 200 } },
+  ...Array.from({ length: 64 }, (_, i) => ({
+    op: 'add',
+    target: 'member-fact',
+    qq: '6868686868',
+    scope: 'group',
+    groupId: '1234567890',
+    value: { text: `低置信琐碎事实编号${i + 1}`, confidence: 0.45, sourceSeq: 201 + i }
+  }))
+];
+applyConsolidation({
+  memDir: root,
+  key: 'group:1234567890',
+  gid: '1234567890',
+  output: parseConsolidationOutput({ schema: 1, patches: evictPatches.slice(0, 35) } && JSON.stringify({ schema: 1, patches: evictPatches.slice(0, 35) })),
+  messages: evictMsgs.slice(0, 35),
+  now: Date.now() + 40_000
+});
+applyConsolidation({
+  memDir: root,
+  key: 'group:1234567890',
+  gid: '1234567890',
+  output: parseConsolidationOutput(JSON.stringify({ schema: 1, patches: evictPatches.slice(35) })),
+  messages: evictMsgs.slice(35),
+  now: Date.now() + 45_000
+});
+const evictMember = JSON.parse(fs.readFileSync(path.join(root, 'members', '6868686868.json'), 'utf8'));
+const kept60 = evictMember.groups['1234567890'].facts;
+check('智能容量淘汰：超过 60 条时保留早期高置信核心事实', kept60.length === 60 && kept60.some((f) => f.text === '高置信核心职业事实'));
+
+// Intl.Segmenter 单字词 + 泛群反查 + 多轮代词指代 + 相对日期映射
+const openCatQuery = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '群里谁怕猫',
+  intent: 'auto',
+  detail: 'brief',
+  messages: [{ seq: 300, sender: '甲', userId: '1111111111', text: '群里谁怕猫', time: Date.now(), isSelf: false }]
+});
+check('泛群反查与分词：不点名提问“群里谁怕猫”能精准召回本群对应成员且不带外群', openCatQuery.text.includes('很怕猫') && !openCatQuery.text.includes('外群人'), openCatQuery.text);
+
+const pronounFollowup = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '那他平时喜欢什么',
+  intent: 'auto',
+  detail: 'brief',
+  messages: [
+    { seq: 301, sender: '甲', userId: '1111111111', text: '你还记得二号机吗', time: Date.now() - 10_000, isSelf: false },
+    { seq: 302, sender: '机器人', userId: '', text: '记得呀', time: Date.now() - 8_000, isSelf: true },
+    { seq: 303, sender: '甲', userId: '1111111111', text: '那他平时喜欢什么', time: Date.now() - 2_000, isSelf: false }
+  ]
+});
+check('多轮代词指代：前文提及成员后用“他”追问可召回对应成员事实', pronounFollowup.text.includes('二号机') && pronounFollowup.text.includes('喜欢拼模型'), pronounFollowup.text);
+
+const dateRangeParsed = extractDateRange('11月3号发生了什么', Date.parse('2026-11-25T12:00:00Z'));
+const dateAnchoredTimeline = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '11月3号发生了什么',
+  intent: 'auto',
+  detail: 'brief',
+  messages,
+  now: Date.parse('2026-11-25T12:00:00Z')
+});
+check('日期锚点：显式日期无词面重合也能命中对应日期时间线', dateRangeParsed?.from === '2026-11-03' && dateAnchoredTimeline.text.includes('迟到'), dateAnchoredTimeline.text);
+
+// 私聊独立 private 作用域 + 动态人设按群/私聊隔离
+const badPrivateGlobal = validatePatchEnvelope(
+  { schema: 1, patches: [{ op: 'add', target: 'member-fact', qq: '1111111111', scope: 'global', value: { text: '私聊不允许写全局', sourceSeq: 1 } }] },
+  { memDir: root, key: 'private:1111111111', messages: [{ seq: 1, sender: '甲', userId: '1111111111', text: '悄悄话', time: Date.now(), isSelf: false }] }
+);
+check('私聊隔离：拒绝私聊补丁写入 global scope', badPrivateGlobal.ok === false && badPrivateGlobal.errors.some((e) => e.includes('private scope')));
+
+applyConsolidation({
+  memDir: root,
+  key: 'private:1111111111',
+  output: parseConsolidationOutput(JSON.stringify({
+    schema: 1,
+    patches: [
+      { op: 'add', target: 'member-fact', qq: '1111111111', scope: 'private', value: { text: '私聊专属秘密心事', confidence: 0.95, sourceSeq: 1 } },
+      { op: 'replace', target: 'persona', value: { tone: '私聊专属温柔语气', catchphrases: ['抱抱'] } }
+    ]
+  })),
+  messages: [{ seq: 1, sender: '甲', userId: '1111111111', text: '跟你说个心事', time: Date.now(), isSelf: false }],
+  now: Date.now() + 50_000
+});
+applyConsolidation({
+  memDir: root,
+  key: 'group:1234567890',
+  gid: '1234567890',
+  output: parseConsolidationOutput(JSON.stringify({
+    schema: 1,
+    patches: [{ op: 'replace', target: 'persona', value: { tone: '测试群专属沙雕语气', catchphrases: ['芜湖'] } }]
+  })),
+  messages: [{ seq: 400, sender: '甲', userId: '1111111111', text: '哈哈哈冲', time: Date.now(), isSelf: false }],
+  now: Date.now() + 55_000
+});
+const dmRecall = buildContext({
+  memDir: root,
+  key: 'private:1111111111',
+  query: '你还记得我的心事吗',
+  intent: 'general',
+  detail: 'full',
+  messages: [{ seq: 2, sender: '甲', userId: '1111111111', text: '你还记得我的心事吗', time: Date.now(), isSelf: false }]
+});
+const group123AfterPrivate = buildContext({
+  memDir: root,
+  key: 'group:1234567890',
+  query: '近况',
+  intent: 'general',
+  detail: 'full',
+  messages: [{ seq: 401, sender: '甲', userId: '1111111111', text: '近况', time: Date.now(), isSelf: false }]
+});
+const group888PersonaCheck = buildContext({
+  memDir: root,
+  key: 'group:888',
+  query: '近况',
+  intent: 'general',
+  detail: 'full',
+  messages: [{ seq: 20, sender: '外群人', userId: '3333333333', text: '近况', time: Date.now(), isSelf: false }]
+});
+check('私聊召回：私聊可读本人 private 事实与私聊专属人设', dmRecall.text.includes('私聊专属秘密心事') && dmRecall.text.includes('私聊专属温柔语气'), dmRecall.text);
+check('作用域强隔离：群聊绝不泄露私聊 private 事实与私聊人设', !group123AfterPrivate.text.includes('私聊专属秘密心事') && !group123AfterPrivate.text.includes('私聊专属温柔语气') && group123AfterPrivate.text.includes('测试群专属沙雕语气'));
+check('动态人设隔离：A 群动态人设不会污染 B 群（B 群回退全局默认人设）', !group888PersonaCheck.text.includes('测试群专属沙雕语气') && group888PersonaCheck.text.includes('简短'));
+
+// 单轮快照复用与整理会话池按会话隔离
+const snap = loadSocialSnapshot(path.join(root, 'bridge', 'state', 'social-v2.json'));
+check('单轮快照：一次读取同时提供 sig、会话列表与内存消息读取', Boolean(snap.sig) && snap.items.length === 1 && readMessages(snap.conversations, 'group:1234567890').messages.length === 3);
+const legacyFlatPool = normalizeConsolidationPool({ sessionId: 'legacy-unscoped', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999' });
+check('会话池：丢弃未绑定会话 key 的旧全局会话防止跨群复用', Object.keys(legacyFlatPool.sessions).length === 0);
+let poolState = normalizeConsolidationPool(null);
+poolState = setScopedSession(poolState, 'group:1234567890', { sessionId: 's-g1', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999', updatedAt: 100 }, { maxSessions: 2 }).pool;
+poolState = setScopedSession(poolState, 'group:888', { sessionId: 's-g2', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999', updatedAt: 200 }, { maxSessions: 2 }).pool;
+check(
+  '会话池：不同群严格隔离各自整理会话 ID',
+  getScopedSession(poolState, { key: 'group:1234567890', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999' })?.sessionId === 's-g1'
+  && getScopedSession(poolState, { key: 'group:888', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999' })?.sessionId === 's-g2'
+  && getScopedSession(poolState, { key: 'private:1111111111', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999' }) === null
+);
+const evictedPool = setScopedSession(poolState, 'private:1111111111', { sessionId: 's-p1', preset: 'qq-chat', baseUrl: 'http://127.0.0.1:9999', updatedAt: 300 }, { maxSessions: 2 });
+check('会话池：超出容量上限按最旧活跃时间 LRU 淘汰', evictedPool.evicted.length === 1 && evictedPool.evicted[0].sessionId === 's-g1');
 
 fs.rmSync(root, { recursive: true, force: true });
 

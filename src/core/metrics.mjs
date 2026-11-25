@@ -14,6 +14,7 @@ const CONSOLIDATE_REASONS = new Set([
   'waiting-min-informative',
   'waiting-max-wait',
   'waiting-quiet',
+  'retry-backoff',
   'source-unavailable',
   'session-unavailable',
   'prompt-rejected',

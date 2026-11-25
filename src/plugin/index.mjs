@@ -53,21 +53,46 @@ function verifyAgainstBridge(cfg, sessionId, key) {
 const NOT_IN_SCOPE = '当前会话不在记忆库范围内。按提示词正常聊天即可，不要编造别人的信息。';
 const contextCache = new Map();
 
+const versionProbeCache = new Map();
+
+function statStamp(file) {
+  try {
+    const st = fs.statSync(file, { bigint: true });
+    return `${st.size}:${st.mtimeNs}`;
+  } catch {
+    return '-';
+  }
+}
+
 function memoryVersion(memDir, key) {
+  const now = Date.now();
+  const stateStamp = statStamp(path.join(memDir, '.state', 'version.json'));
+  const probeKey = `${memDir}|${key}`;
+  const prevProbe = versionProbeCache.get(probeKey);
+  if (prevProbe && prevProbe.stateStamp === stateStamp && now - prevProbe.at < 1500) {
+    return prevProbe.version;
+  }
   const m = /^(group|private):(\d+)$/.exec(String(key));
-  const files = [path.join(memDir, 'persona', 'dynamic.md')];
+  const files = [path.join(memDir, '.state', 'version.json'), path.join(memDir, 'persona', 'dynamic.md')];
   if (m?.[1] === 'group') {
-    files.push(path.join(memDir, 'groups', m[2], 'profile.md'), path.join(memDir, 'groups', m[2], 'meta.json'));
+    files.push(
+      path.join(memDir, 'groups', m[2], 'profile.md'),
+      path.join(memDir, 'groups', m[2], 'meta.json'),
+      path.join(memDir, 'groups', m[2], 'persona.md')
+    );
     try {
       for (const file of fs.readdirSync(path.join(memDir, 'groups', m[2], 'timeline')).sort()) files.push(path.join(memDir, 'groups', m[2], 'timeline', file));
     } catch {}
+  } else if (m?.[1] === 'private') {
+    files.push(path.join(memDir, 'persona', 'private', `${m[2]}.md`));
   }
   try {
     for (const file of fs.readdirSync(path.join(memDir, 'members')).sort()) if (/^\d+\.json$/.test(file)) files.push(path.join(memDir, 'members', file));
   } catch {}
-  return files.map((file) => {
-    try { const st = fs.statSync(file); return `${st.size}:${Math.round(st.mtimeMs)}`; } catch { return '-'; }
-  }).join('|');
+  const version = files.map(statStamp).join('|');
+  versionProbeCache.set(probeKey, { stateStamp, version, at: now });
+  while (versionProbeCache.size > 200) versionProbeCache.delete(versionProbeCache.keys().next().value);
+  return version;
 }
 
 function getCached(key) {

@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { classifyMessage, isInformative } from '../worker/filter.mjs';
+import { fitMessagesToPromptBudget } from './consolidate.mjs';
 
 const HISTORY_LIMIT = 100;
 const BATCH_HISTORY_LIMIT = 50;
@@ -34,6 +35,23 @@ export function pendingQueueFile(memDir, key) {
   return path.join(path.resolve(memDir), '.state', 'pending', `${safeKey(key)}.json`);
 }
 
+export function deadLetterFile(memDir, key) {
+  return path.join(path.resolve(memDir), '.state', 'dead-letter', `${safeKey(key)}.jsonl`);
+}
+
+export function readDeadLetters(memDir, key) {
+  const file = deadLetterFile(memDir, key);
+  if (!fs.existsSync(file)) return [];
+  try {
+    return fs.readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
 function history(queue, event) {
   queue.history.push({ at: Date.now(), ...event });
   if (queue.history.length > HISTORY_LIMIT) queue.history.splice(0, queue.history.length - HISTORY_LIMIT);
@@ -49,7 +67,7 @@ function newQueue(key, { initialSeq = 0, initialAt = 0 } = {}) {
     pending: [],
     inflight: null,
     recovery: { pending: false, sequenceResets: 0, gaps: 0, lastIssue: null },
-    stats: { scanned: 0, ignored: 0, low: 0, normal: 0, important: 0, enqueued: 0, committed: 0 },
+    stats: { scanned: 0, ignored: 0, low: 0, normal: 0, important: 0, enqueued: 0, committed: 0, quarantined: 0 },
     memory: { lastCommittedAt: Number(initialAt) || 0, lastBatchId: '', lastCommittedGeneration: 0, lastCommittedSeq: Math.max(0, Number(initialSeq) || 0) },
     failures: { count: 0, lastAt: 0, lastReason: '' },
     batches: [],
@@ -64,7 +82,7 @@ function normalizeQueue(value, key, init) {
   value.scan = { seq: 0, at: 0, lastMessageAt: 0, ...(value.scan ?? {}) };
   value.source = { firstSeq: 0, lastSeq: 0, lastMessageAt: 0, ...(value.source ?? {}) };
   value.recovery = { pending: false, sequenceResets: 0, gaps: 0, lastIssue: null, ...(value.recovery ?? {}) };
-  value.stats = { scanned: 0, ignored: 0, low: 0, normal: 0, important: 0, enqueued: 0, committed: 0, ...(value.stats ?? {}) };
+  value.stats = { scanned: 0, ignored: 0, low: 0, normal: 0, important: 0, enqueued: 0, committed: 0, quarantined: 0, ...(value.stats ?? {}) };
   value.memory = { lastCommittedAt: 0, lastBatchId: '', lastCommittedGeneration: 0, lastCommittedSeq: 0, ...(value.memory ?? {}) };
   value.failures = { count: 0, lastAt: 0, lastReason: '', ...(value.failures ?? {}) };
   value.batches = Array.isArray(value.batches) ? value.batches : [];
@@ -76,8 +94,22 @@ export function readPendingQueue(memDir, key, init = {}) {
   return normalizeQueue(readJson(pendingQueueFile(memDir, key)), key, init);
 }
 
+function normalizeReplyMeta(message) {
+  const raw = message?.replyTo ?? message?.quote ?? null;
+  if (raw && typeof raw === 'object') {
+    const seq = Number(raw.seq) || 0;
+    const sender = String(raw.sender ?? raw.name ?? '').trim().slice(0, 24);
+    const text = String(raw.text ?? raw.plain ?? '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    if (seq || sender || text) return { ...(seq ? { seq } : {}), ...(sender ? { sender } : {}), ...(text ? { text } : {}) };
+  }
+  if (typeof raw === 'string' && raw.trim()) return { text: raw.replace(/\s+/g, ' ').trim().slice(0, 40) };
+  if (Number.isFinite(Number(message?.replySeq)) && Number(message.replySeq) > 0) return { seq: Number(message.replySeq) };
+  return null;
+}
+
 function storedMessage(message, classification, generation, now, recovery) {
   const seq = Number(message.seq);
+  const replyTo = normalizeReplyMeta(message);
   return {
     id: `g${generation}:s${seq}`,
     generation,
@@ -86,6 +118,7 @@ function storedMessage(message, classification, generation, now, recovery) {
     sender: String(message.sender ?? ''),
     userId: String(message.userId ?? ''),
     text: classification.text.slice(0, 2000),
+    ...(replyTo ? { replyTo } : {}),
     time: Number(message.time) || now,
     isSelf: message.isSelf === true,
     level: classification.level,
@@ -130,9 +163,10 @@ export function scanIntoPending({ memDir, key, messages = [], initialSeq = 0, in
   }
 
   const known = new Set(queue.pending.map((item) => item.id));
+  const priorVisible = visible.filter((message) => Number(message.seq) <= Number(queue.scan.seq));
   const fresh = visible.filter((message) => Number(message.seq) > Number(queue.scan.seq));
   const counts = { scanned: 0, ignored: 0, low: 0, normal: 0, important: 0, enqueued: 0 };
-  let previous = null;
+  let previous = priorVisible.length ? priorVisible[priorVisible.length - 1] : (queue.pending[queue.pending.length - 1] ?? null);
   for (const message of fresh) {
     const classification = classifier(message, { previous });
     previous = message;
@@ -162,11 +196,12 @@ export function scanIntoPending({ memDir, key, messages = [], initialSeq = 0, in
   return { queue, counts, sequenceReset, gap, firstSeq, sourceLastSeq };
 }
 
-export function pendingBatch(queue, maxMessages = 120) {
+export function pendingBatch(queue, maxMessages = 120, { maxChars = 0 } = {}) {
   const first = queue?.pending?.[0];
   if (!first) return [];
   const generation = first.generation;
-  return queue.pending.filter((item) => item.generation === generation).slice(0, Math.max(1, Number(maxMessages) || 120));
+  const sliced = queue.pending.filter((item) => item.generation === generation).slice(0, Math.max(1, Number(maxMessages) || 120));
+  return Number(maxChars) > 0 ? fitMessagesToPromptBudget(sliced, { maxChars: Number(maxChars) }) : sliced;
 }
 
 function batchIdOf(key, items) {
@@ -174,10 +209,10 @@ function batchIdOf(key, items) {
 }
 
 /** prompt 前持久化 attempt；崩溃或模型失败时消息仍留在 pending。 */
-export function beginPendingBatch({ memDir, key, maxMessages = 120, trigger = 'threshold', now = Date.now() } = {}) {
+export function beginPendingBatch({ memDir, key, maxMessages = 120, maxChars = 0, trigger = 'threshold', now = Date.now() } = {}) {
   const file = pendingQueueFile(memDir, key);
   const queue = readPendingQueue(memDir, key);
-  const items = pendingBatch(queue, maxMessages);
+  const items = pendingBatch(queue, maxMessages, { maxChars });
   if (!items.length) return { queue, batchId: '', items: [] };
   const batchId = batchIdOf(key, items);
   const ids = new Set(items.map((item) => item.id));
@@ -194,7 +229,7 @@ export function beginPendingBatch({ memDir, key, maxMessages = 120, trigger = 't
   return { queue, batchId, items: queue.pending.filter((item) => ids.has(item.id)) };
 }
 
-export function failPendingBatch({ memDir, key, batchId, reason = 'failed', now = Date.now() } = {}) {
+export function failPendingBatch({ memDir, key, batchId, reason = 'failed', maxAttempts = 0, now = Date.now() } = {}) {
   const file = pendingQueueFile(memDir, key);
   const queue = readPendingQueue(memDir, key);
   const ids = new Set(queue.inflight?.batchId === batchId ? queue.inflight.itemIds : []);
@@ -203,8 +238,33 @@ export function failPendingBatch({ memDir, key, batchId, reason = 'failed', now 
   queue.failures.lastAt = now;
   queue.failures.lastReason = String(reason).slice(0, 40);
   queue.inflight = null;
+
+  const limit = Number(maxAttempts) > 0 ? Math.max(1, Math.round(Number(maxAttempts))) : 0;
+  const poisoned = limit > 0 ? queue.pending.filter((item) => ids.has(item.id) && (Number(item.attempts) || 0) >= limit) : [];
+  if (poisoned.length) {
+    const poisonIds = new Set(poisoned.map((item) => item.id));
+    const dlFile = deadLetterFile(memDir, key);
+    fs.mkdirSync(path.dirname(dlFile), { recursive: true });
+    const record = {
+      schema: 1,
+      quarantinedAt: new Date(now).toISOString(),
+      key,
+      batchId,
+      reason: queue.failures.lastReason,
+      count: poisoned.length,
+      items: poisoned
+    };
+    fs.appendFileSync(dlFile, JSON.stringify(record) + '\n', 'utf8');
+    queue.pending = queue.pending.filter((item) => !poisonIds.has(item.id));
+    queue.stats.quarantined = (Number(queue.stats.quarantined) || 0) + poisoned.length;
+    queue.failures = { count: 0, lastAt: 0, lastReason: '' };
+    queue.recovery.pending = queue.pending.some((item) => item.recovery === true);
+    history(queue, { type: 'batch-quarantined', batchId, count: poisoned.length, reason: record.reason });
+  } else {
+    history(queue, { type: 'batch-failed', batchId, count: ids.size, reason: queue.failures.lastReason });
+  }
+
   queue.updatedAt = now;
-  history(queue, { type: 'batch-failed', batchId, count: ids.size, reason: queue.failures.lastReason });
   atomicWrite(file, queue);
   return queue;
 }
@@ -217,6 +277,7 @@ export function commitPendingBatch({ memDir, key, batchId, result = {}, now = Da
   const committed = queue.pending.filter((item) => ids.has(item.id));
   queue.pending = queue.pending.filter((item) => !ids.has(item.id));
   queue.stats.committed += committed.length;
+  queue.failures = { count: 0, lastAt: 0, lastReason: '' };
   queue.memory.lastCommittedAt = now;
   queue.memory.lastBatchId = batchId;
   queue.memory.lastCommittedGeneration = committed[committed.length - 1]?.generation ?? queue.memory.lastCommittedGeneration;

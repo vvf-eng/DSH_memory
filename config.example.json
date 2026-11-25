@@ -49,12 +49,18 @@
     "quietMs": 900000,
     "maxWaitMs": 43200000,
     "maxMessages": 150,
+    "promptMaxChars": 6000,
+    "includePrivate": true,
+    "retryBaseMs": 300000,
+    "retryMaxMs": 21600000,
+    "maxBatchAttempts": 5,
     "preset": "qq-chat",
     "workspaceTitle": "QQ 记忆整理",
     "timeoutMs": 180000
   },
   "worker": {
     "pollMs": 300000,
+    "watchScanMs": 30000,
     "dshClientPath": "",
     "provider": "deepseek-official",
     "model": "deepseek-flash",

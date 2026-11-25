@@ -18,7 +18,7 @@
           "op": { "enum": ["add", "replace", "remove"] },
           "target": { "enum": ["timeline", "member-fact", "persona"] },
           "qq": { "type": "string", "pattern": "^[0-9]{4,12}$" },
-          "scope": { "enum": ["global", "group"] },
+          "scope": { "enum": ["global", "group", "private"] },
           "groupId": { "type": "string", "pattern": "^[0-9]{1,20}$" },
           "id": { "type": "string", "minLength": 1, "maxLength": 120 },
           "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },

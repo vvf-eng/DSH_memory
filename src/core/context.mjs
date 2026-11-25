@@ -10,7 +10,7 @@
 //   - 输出是纯文本，按优先级拼装，超预算时从低优先级开始整段丢弃。
 import fs from 'node:fs';
 import path from 'node:path';
-import { mentionedMemberIds, rankMemoryCandidates } from './retrieval.mjs';
+import { extractTerms, isOpenGroupMemberQuery, mentionedMemberIds, overlapScore, rankMemoryCandidates } from './retrieval.mjs';
 import { normalizeMemberFacts } from './facts.mjs';
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
@@ -81,6 +81,14 @@ export function extractSection(markdown, keywords) {
   return out.join('\n');
 }
 
+const memberFileCache = new Map();
+const timelineFileCache = new Map();
+const FILE_CACHE_MAX = 2000;
+
+function trimMapCache(map, limit) {
+  while (map.size > limit) map.delete(map.keys().next().value);
+}
+
 export function loadMembers(memDir) {
   const dir = path.join(memDir, 'members');
   let entries = [];
@@ -92,8 +100,26 @@ export function loadMembers(memDir) {
   const out = [];
   for (const e of entries) {
     if (!e.isFile() || !/^\d+\.json$/.test(e.name)) continue;
-    const m = readJsonFile(path.join(dir, e.name), null);
-    if (m && typeof m === 'object') out.push(normalizeMemberFacts(m));
+    const full = path.join(dir, e.name);
+    let sig = '';
+    try {
+      const st = fs.statSync(full, { bigint: true });
+      sig = `${st.size}:${st.mtimeNs}`;
+    } catch {
+      continue;
+    }
+    const hit = memberFileCache.get(full);
+    if (hit && hit.sig === sig) {
+      out.push(hit.value);
+      continue;
+    }
+    const m = readJsonFile(full, null);
+    if (m && typeof m === 'object') {
+      const normalized = normalizeMemberFacts(m);
+      memberFileCache.set(full, { sig, value: normalized });
+      trimMapCache(memberFileCache, FILE_CACHE_MAX);
+      out.push(normalized);
+    }
   }
   return out;
 }
@@ -171,8 +197,7 @@ export function readTimeline(memDir, gid, { days = 2, now = Date.now(), maxPoint
   return { days: collected.slice(0, days) };
 }
 
-export function readDynamicPersona(memDir) {
-  const md = readTextFile(path.join(memDir, 'persona', 'dynamic.md'));
+function cleanPersonaText(md) {
   if (!md) return '';
   const lines = md
     .split('\n')
@@ -182,8 +207,18 @@ export function readDynamicPersona(memDir) {
     .filter((l) => l && !isPlaceholder(l))
     // 模板占位（"最近口头禅：（待生成）"）不算内容
     .filter((l) => !/（待生成）|\(待生成\)|^更新时间/.test(l));
-  const text = normalize(lines.join('\n'));
-  return text;
+  return normalize(lines.join('\n'));
+}
+
+export function readDynamicPersona(memDir, parsed = null) {
+  if (parsed?.kind === 'group' && parsed.id) {
+    const groupText = cleanPersonaText(readTextFile(path.join(memDir, 'groups', parsed.id, 'persona.md')));
+    if (groupText) return groupText;
+  } else if (parsed?.kind === 'private' && parsed.id) {
+    const privateText = cleanPersonaText(readTextFile(path.join(memDir, 'persona', 'private', `${parsed.id}.md`)));
+    if (privateText) return privateText;
+  }
+  return cleanPersonaText(readTextFile(path.join(memDir, 'persona', 'dynamic.md')));
 }
 
 function formatClock(ms) {
@@ -198,16 +233,33 @@ function readAllTimelinePoints(memDir, gid) {
   try { files = fs.readdirSync(dir).filter((f) => /^\d{4}-\d{2}\.md$/.test(f)).sort().reverse(); } catch { return []; }
   const out = [];
   for (const file of files.slice(0, 12)) {
-    const md = readTextFile(path.join(dir, file));
+    const full = path.join(dir, file);
+    let sig = '';
+    try {
+      const st = fs.statSync(full, { bigint: true });
+      sig = `${st.size}:${st.mtimeNs}`;
+    } catch {
+      continue;
+    }
+    const hit = timelineFileCache.get(full);
+    if (hit && hit.sig === sig) {
+      out.push(...hit.points);
+      continue;
+    }
+    const md = readTextFile(full);
+    const points = [];
     for (const block of md.split(/^##\s+/m).slice(1)) {
       const lines = block.split('\n');
       const date = lines[0].trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
       for (const line of lines.slice(1)) {
         const text = line.replace(/^\s*[-*]\s*/, '').trim();
-        if (text && !isPlaceholder(text) && !/^（v0\.5/.test(text)) out.push({ date, text });
+        if (text && !isPlaceholder(text) && !/^（v0\.5/.test(text)) points.push({ date, text });
       }
     }
+    timelineFileCache.set(full, { sig, points });
+    trimMapCache(timelineFileCache, 500);
+    out.push(...points);
   }
   return out;
 }
@@ -242,12 +294,16 @@ function aliasesOf(member, gid) {
     .map((s) => String(s ?? '').trim()).filter(Boolean);
 }
 
-function scopedFacts(member, gid) {
+function scopedFacts(member, gid, kind = 'group') {
   const out = [];
   for (const fact of member?.global?.facts ?? []) {
     if (String(fact?.scope ?? 'global') === 'global') out.push({ ...fact, scope: 'global' });
   }
-  if (gid) for (const fact of member?.groups?.[gid]?.facts ?? []) out.push({ ...fact, scope: 'group', groupId: gid });
+  if (kind === 'private') {
+    for (const fact of member?.private?.facts ?? []) out.push({ ...fact, scope: 'private' });
+  } else if (gid) {
+    for (const fact of member?.groups?.[gid]?.facts ?? []) out.push({ ...fact, scope: 'group', groupId: gid });
+  }
   return out;
 }
 
@@ -307,13 +363,33 @@ export function buildContext({
   const speakerMember = speaker ? findMember(members, { qq: speaker.qq, name: speaker.name }, gid) : null;
   const mentionPool = gid ? members.filter((member) => member?.groups?.[gid]) : members;
   const mentioned = mentionedMemberIds(mentionPool, effectiveQuery, gid);
-  const allowedIds = new Set(mentioned);
+  const contextMentioned = new Set();
+  if (gid && mentioned.size === 0 && /他|她|这人|那个人|这位|对方/.test(effectiveQuery)) {
+    const poolIds = new Set(mentionPool.map((m) => String(m?.qq ?? '')));
+    const recentPrior = allMessages.slice(-5, -1).reverse();
+    for (const msg of recentPrior) {
+      const msgText = String(msg?.text ?? msg?.plain ?? '').trim();
+      if (msgText) {
+        for (const id of mentionedMemberIds(mentionPool, msgText, gid)) {
+          if (id !== String(speakerMember?.qq ?? '')) contextMentioned.add(id);
+        }
+      }
+      const authorId = String(msg?.userId ?? '').trim();
+      if (!msg?.isSelf && authorId && authorId !== String(speaker?.qq ?? '') && poolIds.has(authorId)) {
+        contextMentioned.add(authorId);
+      }
+      if (contextMentioned.size >= 2) break;
+    }
+  }
+  const allowedIds = new Set([...mentioned, ...contextMentioned]);
   if (speakerMember?.qq) allowedIds.add(String(speakerMember.qq));
-  // 私聊只允许该私聊对象的全局事实；群聊只允许当前说话人和查询明确点名的人。
+  // 私聊只允许该私聊对象本人的全局+私聊事实；群聊只允许当前说话人、明确点名/指代的人，以及泛群人物查询词面命中的本群成员事实。
   if (parsed.kind === 'private') {
     allowedIds.clear();
     allowedIds.add(parsed.id);
   }
+  const openGroupLookup = Boolean(gid) && mentioned.size === 0 && isOpenGroupMemberQuery(effectiveQuery);
+  const openQueryTerms = openGroupLookup ? extractTerms(effectiveQuery) : null;
 
   let groupMeta = null;
   let profile = '';
@@ -336,7 +412,9 @@ export function buildContext({
 
   for (const member of members) {
     const memberId = String(member?.qq ?? '');
-    if (!allowedIds.has(memberId)) continue;
+    const inAllowed = allowedIds.has(memberId);
+    const inOpenGroupPool = !inAllowed && openGroupLookup && Boolean(member?.groups?.[gid]);
+    if (!inAllowed && !inOpenGroupPool) continue;
     const aliases = aliasesOf(member, gid);
     const groupOldAliases = groupOldAliasesOf(member, gid);
     const label = (gid && member?.groups?.[gid]?.alias)
@@ -346,22 +424,43 @@ export function buildContext({
       || '成员';
     const relation = gid ? String(member?.groups?.[gid]?.relation ?? '') : '';
     const tags = (Array.isArray(member?.global?.tags) ? member.global.tags : []).slice(0, 4).map(String);
-    const profileBits = [
-      relation && `关系：${relation}`,
-      groupOldAliases.length && `旧称：${groupOldAliases.slice(0, 3).join('、')}`,
-      tags.length && `标签：${tags.join('、')}`,
-      member?.owner === true && '管理员本人'
-    ].filter(Boolean);
-    if (profileBits.length) candidates.push({ type: relation ? 'relationship' : 'member', text: profileBits.join('｜'), label, memberId, aliases, relation, scope: gid ? 'group' : 'global', groupId: gid, importance: 0.8, confidence: 1 });
-    for (const fact of scopedFacts(member, gid)) {
+    if (inAllowed) {
+      const profileBits = [
+        relation && `关系：${relation}`,
+        groupOldAliases.length && `旧称：${groupOldAliases.slice(0, 3).join('、')}`,
+        tags.length && `标签：${tags.join('、')}`,
+        member?.owner === true && '管理员本人'
+      ].filter(Boolean);
+      if (profileBits.length) candidates.push({ type: relation ? 'relationship' : 'member', text: profileBits.join('｜'), label, memberId, aliases, relation, scope: gid ? 'group' : 'global', groupId: gid, importance: 0.8, confidence: 1 });
+    }
+    for (const fact of scopedFacts(member, gid, parsed.kind)) {
+      if (inOpenGroupPool && overlapScore(openQueryTerms, fact.text) <= 0) continue;
       const relationship = /关系|吵架|和好|冷战|朋友|熟人|对象|同学|同事/.test(String(fact.text ?? ''));
-      candidates.push({ ...fact, type: relationship ? 'relationship' : 'member', label, memberId, aliases, relation });
+      candidates.push({
+        ...fact,
+        type: relationship ? 'relationship' : 'member',
+        label,
+        memberId,
+        aliases,
+        relation,
+        ...(inOpenGroupPool ? { openLookupMatch: true } : {})
+      });
     }
   }
 
-  const persona = readDynamicPersona(memDir);
+  const persona = readDynamicPersona(memDir, parsed);
   if (persona) candidates.push({ type: 'persona', text: persona, importance: 0.4, confidence: 1 });
-  const ranked = rankMemoryCandidates({ candidates, query: effectiveQuery, intent, detail: mode, speakerId: speakerMember?.qq ?? speaker?.qq ?? '', mentionedIds: mentioned, gid, now });
+  const ranked = rankMemoryCandidates({
+    candidates,
+    query: effectiveQuery,
+    intent,
+    detail: mode,
+    speakerId: speakerMember?.qq ?? speaker?.qq ?? '',
+    mentionedIds: mentioned,
+    contextMentionedIds: contextMentioned,
+    gid,
+    now
+  });
 
   const selected = ranked.selected;
   const rules = selected.filter((c) => c.type === 'rule' || c.type === 'vibe').map((c) => `· ${clip(c.text, mode === 'full' ? 180 : 100)}`);

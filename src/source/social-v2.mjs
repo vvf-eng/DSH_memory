@@ -28,10 +28,7 @@ export function loadSocialV2(file) {
   return { conversations: data.conversations, error: '' };
 }
 
-/** [{ key, kind, id, lastSeq, messageCount }]，只列 group: / private: 形式的会话。 */
-export function listConversations(file) {
-  const { conversations, error } = loadSocialV2(file);
-  if (error) return { items: [], error };
+function parseConversationItems(conversations) {
   const items = [];
   for (const [key, st] of Object.entries(conversations)) {
     const m = /^(group|private):(\d{1,20})$/.exec(key);
@@ -45,12 +42,37 @@ export function listConversations(file) {
       messageCount: messages.length
     });
   }
-  return { items, error: '' };
+  return items;
+}
+
+/** 一次读取并解析完整快照（含文件签名），供单轮 worker 复用避免重复 JSON.parse。 */
+export function loadSocialSnapshot(file) {
+  let sig = '';
+  try {
+    const st = fs.statSync(file, { bigint: true });
+    sig = `${st.size}:${st.mtimeNs}`;
+  } catch {
+    return { conversations: {}, items: [], sig: '', error: 'social-v2 不可读或不存在' };
+  }
+  const { conversations, error } = loadSocialV2(file);
+  if (error) return { conversations: {}, items: [], sig, error };
+  return { conversations, items: parseConversationItems(conversations), sig, error: '' };
+}
+
+/** [{ key, kind, id, lastSeq, messageCount }]，只列 group: / private: 形式的会话。 */
+export function listConversations(file) {
+  const { conversations, error } = loadSocialV2(file);
+  if (error) return { items: [], error };
+  return { items: parseConversationItems(conversations), error: '' };
 }
 
 /** 原样返回某会话的 recentMessages（字段透传，不做任何改写）。 */
-export function readMessages(file, key) {
-  const { conversations, error } = loadSocialV2(file);
+export function readMessages(fileOrConversations, key) {
+  if (fileOrConversations && typeof fileOrConversations === 'object') {
+    const st = fileOrConversations[key];
+    return { messages: Array.isArray(st?.recentMessages) ? st.recentMessages : [], error: '' };
+  }
+  const { conversations, error } = loadSocialV2(fileOrConversations);
   if (error) return { messages: [], error };
   const st = conversations[key];
   return { messages: Array.isArray(st?.recentMessages) ? st.recentMessages : [], error: '' };

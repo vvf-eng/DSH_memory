@@ -17,7 +17,14 @@ import { loadMemoryConfig } from '../core/config.mjs';
 import { anonymizeConversation, appendMetric } from '../core/metrics.mjs';
 import { acquireWorkerLock } from '../core/worker-lock.mjs';
 import { evaluatePendingTrigger } from '../core/batching.mjs';
-import { nextSessionBudget, sessionRetirementReason } from '../core/session-budget.mjs';
+import {
+  deleteScopedSession,
+  getScopedSession,
+  nextSessionBudget,
+  normalizeConsolidationPool,
+  sessionRetirementReason,
+  setScopedSession
+} from '../core/session-budget.mjs';
 import {
   applyConsolidation,
   buildConsolidationPrompt,
@@ -33,7 +40,7 @@ import {
   pendingBatch,
   scanIntoPending
 } from '../core/pending.mjs';
-import { listConversations, loadSocialV2, readMessages } from '../source/social-v2.mjs';
+import { listConversations, loadSocialSnapshot, loadSocialV2, readMessages } from '../source/social-v2.mjs';
 import { loadQQbridgeDshAdapter } from '../adapters/qqbridge-dsh.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -186,10 +193,10 @@ function mergeUsage(...items) {
   return total;
 }
 
-function patchValidationErrors(parsed, messages, gid) {
+function patchValidationErrors(parsed, messages, key, gid) {
   if (!parsed?.ok) return [String(parsed?.error ?? '没有找到合法 JSON 对象')];
   if (!parsed.patchEnvelope) return ['必须输出 {"schema":1,"patches":[...]}，不再接受旧 timeline/members 结果格式'];
-  const checked = validatePatchEnvelope(parsed.patchEnvelope, { memDir: DATA, gid, messages });
+  const checked = validatePatchEnvelope(parsed.patchEnvelope, { memDir: DATA, key, gid, messages });
   return checked.ok ? [] : checked.errors;
 }
 
@@ -255,10 +262,18 @@ async function reconnectDsh(error) {
   startStream();
 }
 
-async function ensureSession() {
+async function archiveRemoteSession(entry, reason = 'evicted') {
+  if (!entry?.sessionId) return;
+  try { await api?.stopSessionWork?.(entry.sessionId); } catch {}
+  try { await api?.workspace?.archiveSession({ sessionId: entry.sessionId }); } catch {}
+  log(`♻ 退役整理会话 ${entry.sessionId}（${entry.key || 'unknown'}）：${reason}（batches=${entry.batches ?? 0}, steps=${entry.steps ?? 0}, tokens=${entry.tokens ?? 0}）`);
+}
+
+async function ensureSession(key) {
   const preset = CFG.consolidate.preset || 'qq-chat';
-  const saved = readJson(SESSION_FILE, null);
-  if (saved?.sessionId && saved.preset === preset && saved.baseUrl === baseUrl) {
+  const pool = normalizeConsolidationPool(readJson(SESSION_FILE, null));
+  const saved = getScopedSession(pool, { key, preset, baseUrl });
+  if (saved?.sessionId) {
     api.events.follow(saved.sessionId);
     return saved.sessionId;
   }
@@ -276,46 +291,53 @@ async function ensureSession() {
     model: CFG.worker.model,
     reasoningEffort: CFG.worker.reasoningEffort
   });
-  writeJson(SESSION_FILE, { sessionId, workspaceId: ws.workspace.workspaceId, preset, baseUrl, batches: 0, steps: 0, tokens: 0 });
+  const entry = { sessionId, workspaceId: ws.workspace.workspaceId, key, preset, baseUrl, batches: 0, steps: 0, tokens: 0, updatedAt: Date.now() };
+  const updated = setScopedSession(pool, key, entry, { maxSessions: 8 });
+  writeJson(SESSION_FILE, updated.pool);
+  for (const evicted of updated.evicted) await archiveRemoteSession(evicted, '会话池上限淘汰');
   api.events.follow(sessionId);
-  log(`已创建整理会话：${sessionId}（preset=${preset}）`);
+  log(`已创建隔离整理会话：${sessionId}（key=${key}，preset=${preset}）`);
   return sessionId;
 }
 
-async function dropSession() {
-  try {
-    fs.unlinkSync(SESSION_FILE);
-  } catch {}
+async function dropSession(key = '', sessionId = '') {
+  if (!key && !sessionId) {
+    try { fs.unlinkSync(SESSION_FILE); } catch {}
+    return;
+  }
+  const current = readJson(SESSION_FILE, null);
+  if (!current) return;
+  const { pool } = deleteScopedSession(current, { key, sessionId });
+  writeJson(SESSION_FILE, pool);
 }
 
-async function retireConsolidationSession(sessionId, reason) {
-  const saved = readJson(SESSION_FILE, null);
-  if (!saved || saved.sessionId !== sessionId) return;
-  try { await api.stopSessionWork?.(sessionId); } catch {}
-  try { await api.workspace.archiveSession({ sessionId }); } catch {}
-  await dropSession();
-  log(`♻ 退役整理会话 ${sessionId}：${reason}（batches=${saved.batches}, steps=${saved.steps}, tokens=${saved.tokens}）`);
+async function retireConsolidationSession(key, sessionId, reason) {
+  const current = readJson(SESSION_FILE, null);
+  const { pool, removed } = deleteScopedSession(current, { key, sessionId });
+  if (!removed.length) return;
+  writeJson(SESSION_FILE, pool);
+  for (const entry of removed) await archiveRemoteSession(entry, reason);
 }
 
-async function accountConsolidationSession(sessionId, turn, usage) {
-  const saved = readJson(SESSION_FILE, null);
+async function accountConsolidationSession(key, sessionId, turn, usage) {
+  const pool = normalizeConsolidationPool(readJson(SESSION_FILE, null));
+  const saved = pool.sessions[String(key)];
   if (!saved || saved.sessionId !== sessionId) return '';
   const budget = nextSessionBudget(saved, { steps: turn?.steps, usage });
   const next = { ...saved, ...budget, updatedAt: Date.now() };
-  writeJson(SESSION_FILE, next);
+  pool.sessions[String(key)] = next;
+  writeJson(SESSION_FILE, pool);
   const reason = sessionRetirementReason(next, CFG.worker.consolidationSession);
-  if (reason) await retireConsolidationSession(sessionId, reason);
+  if (reason) await retireConsolidationSession(key, sessionId, reason);
   return reason;
 }
 
-// ── 一轮整理 ────────────────────────────────────────────────────────────────
-async function consolidateGroup(item) {
-  const { key, id } = item;
-  const { messages, error } = readMessages(CFG.bridge.socialV2, key);
-  if (error) return { ok: false, reason: 'source-unavailable', rawMessages: 0 };
-
-  // v0.10.1：先把 social-v2 可见窗口扫描进本地持久队列。无价值消息和有价值消息的
-  // scan 推进与 pending 入队在同一次原子写里完成；从此整理输入不再依赖上游短窗口存活。
+function scanConversationItem(item, conversationsSnapshot = null) {
+  const { key } = item;
+  const { messages, error } = conversationsSnapshot
+    ? readMessages(conversationsSnapshot, key)
+    : readMessages(CFG.bridge.socialV2, key);
+  if (error) return { ok: false, error };
   const legacy = readCursor(DATA, key);
   const scanned = scanIntoPending({
     memDir: DATA,
@@ -325,7 +347,6 @@ async function consolidateGroup(item) {
     initialAt: legacy.lastAt
   });
   const { sequenceReset, gap } = scanned;
-  const queued = scanned.queue.pending;
   if (sequenceReset || gap) {
     const detail = {
       scanSeq: scanned.queue.scan.seq,
@@ -342,6 +363,18 @@ async function consolidateGroup(item) {
       + `${gap ? `, missing=${gap.from}-${gap.to}` : ''}；可恢复消息已进入 pending`
     );
   }
+  return { ok: true, scanned };
+}
+
+// ── 一轮整理 ────────────────────────────────────────────────────────────────
+async function consolidateConversation(item, conversationsSnapshot = null) {
+  const { key, kind, id } = item;
+  const gid = kind === 'group' ? id : '';
+  const scanRes = scanConversationItem(item, conversationsSnapshot);
+  if (!scanRes.ok) return { ok: false, reason: 'source-unavailable', rawMessages: 0 };
+  const { scanned } = scanRes;
+  const { sequenceReset, gap } = scanned;
+  const queued = scanned.queue.pending;
   const decision = evaluatePendingTrigger(scanned.queue, CFG.consolidate);
   if (!decision.ready) {
     return {
@@ -357,25 +390,38 @@ async function consolidateGroup(item) {
     };
   }
 
-  const preview = pendingBatch(scanned.queue, CFG.consolidate.maxMessages);
+  const promptMaxChars = CFG.consolidate.promptMaxChars;
+  const preview = pendingBatch(scanned.queue, CFG.consolidate.maxMessages, { maxChars: promptMaxChars });
 
-  const meta = readJson(path.join(DATA, 'groups', id, 'meta.json'), null);
+  const meta = gid ? readJson(path.join(DATA, 'groups', gid, 'meta.json'), null) : null;
   const groupName = meta?.name ?? key;
 
   let sessionId;
   try {
-    sessionId = await ensureSession();
+    sessionId = await ensureSession(key);
   } catch (error) {
-    await dropSession();
+    await dropSession(key);
     return { ok: false, reason: 'session-unavailable', rawMessages: 0, informativeMessages: preview.length, pendingDepth: queued.length, sequenceReset, gapDetected: Boolean(gap) };
   }
 
   const trigger = decision.trigger;
-  const startedBatch = beginPendingBatch({ memDir: DATA, key, maxMessages: CFG.consolidate.maxMessages, trigger });
+  const startedBatch = beginPendingBatch({
+    memDir: DATA,
+    key,
+    maxMessages: CFG.consolidate.maxMessages,
+    maxChars: promptMaxChars,
+    trigger
+  });
   const pending = startedBatch.items;
   const batchId = startedBatch.batchId;
-  const failBatch = (reason) => failPendingBatch({ memDir: DATA, key, batchId, reason });
-  const prompt = buildConsolidationPrompt({ groupName, key, messages: pending });
+  const failBatch = (reason) => failPendingBatch({
+    memDir: DATA,
+    key,
+    batchId,
+    reason,
+    maxAttempts: CFG.consolidate.maxBatchAttempts
+  });
+  const prompt = buildConsolidationPrompt({ groupName, key, messages: pending, maxChars: promptMaxChars, memDir: DATA });
   // 先登记 waiter 再发 prompt，避免极快的 turn/start + turn/end 在 waiter 建立前丢失。
   const turnPromise = waitTurn(sessionId, CFG.consolidate.timeoutMs);
   let accepted;
@@ -395,7 +441,7 @@ async function consolidateGroup(item) {
     const code = String(accepted?.result?.error?.code ?? '?');
     settle(sessionId, 'err', `prompt-rejected:${code}`);
     try { await turnPromise; } catch {}
-    if (/session|not.?found|404/i.test(code)) await dropSession();
+    if (/session|not.?found|404/i.test(code)) await dropSession(key, sessionId);
     failBatch('prompt-rejected');
     return { ok: false, reason: 'prompt-rejected', rawMessages: pending.length, informativeMessages: pending.length, pendingDepth: queued.length, trigger, sequenceReset, gapDetected: Boolean(gap) };
   }
@@ -411,20 +457,17 @@ async function consolidateGroup(item) {
   let usage = normalizeUsage(turn.usage);
   let parsed = parseConsolidationOutput(output);
   if (!parsed.ok) {
-    // 关键：解析失败**不推进游标**，下一轮重试
+    // 关键：解析失败**不推进游标**，下一轮重试（达上限则入死信隔离）
     log(`✗ ${key} 解析失败（输出 ${String(output).length} 字）：${String(output).replace(/\s+/g, ' ').slice(0, 100)}`);
     failBatch('parse-failed');
-    await accountConsolidationSession(sessionId, turn, usage);
+    await accountConsolidationSession(key, sessionId, turn, usage);
     return { ok: false, reason: 'parse-failed', rawMessages: pending.length, informativeMessages: pending.length, pendingDepth: queued.length, trigger, usage, sequenceReset, gapDetected: Boolean(gap) };
   }
 
-  // v0.11.4 修复：严格校验仍是最终边界，但不要让一次可纠正的模型格式错误把
-  // 同一批 pending 永久卡住。把本地校验器的精确错误反馈给整理会话，最多重试一次。
-  // 二次失败仍不落盘、不出队，并退役这个已形成错误惯性的整理会话。
-  let validationErrors = patchValidationErrors(parsed, pending, id);
+  let validationErrors = patchValidationErrors(parsed, pending, key, gid);
   if (validationErrors.length) {
     log(`⚠ ${key} 补丁不合规，进行一次纠错：${validationErrors.slice(0, 4).join('；')}`);
-    const repairPrompt = buildConsolidationRepairPrompt({ groupName, key, messages: pending, errors: validationErrors });
+    const repairPrompt = buildConsolidationRepairPrompt({ groupName, key, messages: pending, errors: validationErrors, maxChars: promptMaxChars, memDir: DATA });
     const repairPromise = waitTurn(sessionId, CFG.consolidate.timeoutMs);
     let repairAccepted;
     try {
@@ -444,7 +487,7 @@ async function consolidateGroup(item) {
       settle(sessionId, 'err', `repair-prompt-rejected:${code}`);
       try { await repairPromise; } catch {}
       failBatch('repair-prompt-rejected');
-      await accountConsolidationSession(sessionId, turn, usage);
+      await accountConsolidationSession(key, sessionId, turn, usage);
       return { ok: false, reason: 'repair-prompt-rejected', rawMessages: pending.length, informativeMessages: pending.length, pendingDepth: queued.length, trigger, usage, sequenceReset, gapDetected: Boolean(gap) };
     }
 
@@ -459,29 +502,29 @@ async function consolidateGroup(item) {
     turn = { ...repairTurn, steps: (Number(turn.steps) || 0) + (Number(repairTurn.steps) || 0) };
     output = repairTurn.text;
     parsed = parseConsolidationOutput(output);
-    validationErrors = patchValidationErrors(parsed, pending, id);
+    validationErrors = patchValidationErrors(parsed, pending, key, gid);
     if (validationErrors.length) {
       log(`✗ ${key} 补丁纠错仍失败：${validationErrors.slice(0, 8).join('；')}`);
       failBatch('patch-invalid');
-      await accountConsolidationSession(sessionId, turn, usage);
-      await retireConsolidationSession(sessionId, '补丁纠错仍失败');
+      await accountConsolidationSession(key, sessionId, turn, usage);
+      await retireConsolidationSession(key, sessionId, '补丁纠错仍失败');
       return { ok: false, reason: 'patch-invalid', rawMessages: pending.length, informativeMessages: pending.length, pendingDepth: queued.length, trigger, usage, sequenceReset, gapDetected: Boolean(gap) };
     }
     log(`✓ ${key} 补丁纠错通过`);
   }
-  if (!parsed.timeline.length) {
+  if (gid && !parsed.timeline.length) {
     log(`⚠ ${key} 模型没给 timeline（输出 ${String(output).length} 字）`);
   }
 
   let applied;
   try {
-    applied = applyConsolidation({ memDir: DATA, key, gid: id, output: parsed, messages: pending });
+    applied = applyConsolidation({ memDir: DATA, key, gid, output: parsed, messages: pending });
     commitPendingBatch({ memDir: DATA, key, batchId, result: applied });
   } catch (error) {
     failBatch('apply-failed');
     throw error;
   }
-  const sessionRetiredBy = await accountConsolidationSession(sessionId, turn, usage);
+  const sessionRetiredBy = await accountConsolidationSession(key, sessionId, turn, usage);
   log(
     `✓ ${key}：时间线 +${applied.timelinePoints}，事实 +${applied.memberFacts}，`
     + `活跃度 +${applied.interactions}，人设${applied.personaUpdated ? '已更新' : '未变'}，`
@@ -583,12 +626,15 @@ function bridgePost(urlPath, body) {
   });
 }
 
-async function maybeRecycleSessions() {
+async function maybeRecycleSessions(conversationsSnapshot = null) {
   const opt = CFG.worker.reset;
   if (!opt?.enabled) return;
   const now = Date.now();
   const state = readJson(RESET_FILE, {}) || {};
-  const { conversations, error } = loadSocialV2(CFG.bridge.socialV2);
+  const loaded = conversationsSnapshot
+    ? { conversations: conversationsSnapshot, error: '' }
+    : loadSocialV2(CFG.bridge.socialV2);
+  const { conversations, error } = loaded;
   if (error) {
     log(`⚠ 会话退役跳过：${error}`);
     return;
@@ -624,47 +670,116 @@ async function maybeRecycleSessions() {
   if (recycled) log(`本轮回收 ${recycled} 个会话（省 token）`);
 }
 
-async function runOnce() {
-  const started = Date.now();
-  const { items, error } = listConversations(CFG.bridge.socialV2);
-  if (error) {
-    log(`✗ 读不到 social-v2：${error}`);
-    return;
-  }
-  await maybeRecycleSessions();
-  if (!CFG.consolidate.enabled) {
-    log('记忆整理已由 config.consolidate.enabled=false 关闭；本轮只执行会话退役检查');
-    return;
-  }
-  const groups = items.filter((i) => i.kind === 'group');
-  if (!groups.length) {
-    log('没有可整理的群会话');
-    return;
-  }
-  for (const item of groups) {
-    const itemStarted = Date.now();
-    try {
-      let r;
+let taskChain = Promise.resolve();
+function runSerialized(fn) {
+  const next = taskChain.then(fn, fn);
+  taskChain = next.catch(() => {});
+  return next;
+}
+
+let lastScannedSig = '';
+let sourceWatcher = null;
+let watchDebounceTimer = null;
+let watchFallbackTimer = null;
+
+function targetItems(items) {
+  return CFG.consolidate.includePrivate ? items : items.filter((i) => i.kind === 'group');
+}
+
+/** 高频纯本地增量扫描（不调模型，零 token 消耗），防止活跃群刷屏滚出 social-v2 窗口造成断档。 */
+function scanOnlyIfChanged() {
+  return runSerialized(async () => {
+    if (!CFG.consolidate.enabled || stopping) return;
+    const snap = loadSocialSnapshot(CFG.bridge.socialV2);
+    if (snap.error || !snap.sig || snap.sig === lastScannedSig) return;
+    lastScannedSig = snap.sig;
+    for (const item of targetItems(snap.items)) {
       try {
-        r = await consolidateGroup(item);
+        scanConversationItem(item, snap.conversations);
       } catch (error) {
-        if (!isDshConnectionError(error)) throw error;
-        // DSH 桌面版每次重启会换随机端口。当前批次已经在 pending 中，连接恢复后
-        // 原地重试一次不会丢消息；若再次失败则落入外层错误处理，等待下个轮询。
-        await reconnectDsh(error);
-        r = await consolidateGroup(item);
+        log(`⚠ 快速扫描 ${item.key} 异常：${error?.message ?? error}`);
       }
-      recordConsolidationMetric(item, r, Date.now() - itemStarted);
-      if (r?.skipped) log(`- ${item.key} 跳过：${r.skipped}`);
-      if (r && r.ok === false) log(`✗ ${item.key}：${r.reason}`);
-    } catch (error) {
-      recordConsolidationMetric(item, { ok: false, reason: 'exception' }, Date.now() - itemStarted);
-      // 会话失效就丢弃、下一轮重建
-      if (/session|会话|not found|404/i.test(String(error?.message ?? error))) await dropSession();
-      log(`✗ ${item.key} 异常：${error?.message ?? error}`);
     }
-  }
-  log(`本轮结束，用时 ${Date.now() - started}ms`);
+  });
+}
+
+function startSourceWatcher() {
+  const targetFile = path.resolve(CFG.bridge.socialV2);
+  const dir = path.dirname(targetFile);
+  const baseName = path.basename(targetFile);
+  const triggerScan = () => {
+    if (stopping || watchDebounceTimer) return;
+    watchDebounceTimer = setTimeout(() => {
+      watchDebounceTimer = null;
+      void scanOnlyIfChanged();
+    }, 1200);
+    watchDebounceTimer.unref?.();
+  };
+  try {
+    if (fs.existsSync(dir)) {
+      sourceWatcher = fs.watch(dir, (_event, filename) => {
+        if (!filename || String(filename) === baseName) triggerScan();
+      });
+      sourceWatcher.on('error', () => {});
+      sourceWatcher.unref?.();
+    }
+  } catch {}
+  watchFallbackTimer = setInterval(() => {
+    void scanOnlyIfChanged();
+  }, CFG.worker.watchScanMs);
+  watchFallbackTimer.unref?.();
+}
+
+function stopSourceWatcher() {
+  if (watchDebounceTimer) { clearTimeout(watchDebounceTimer); watchDebounceTimer = null; }
+  if (watchFallbackTimer) { clearInterval(watchFallbackTimer); watchFallbackTimer = null; }
+  if (sourceWatcher) { try { sourceWatcher.close(); } catch {} sourceWatcher = null; }
+}
+
+async function runOnce() {
+  return runSerialized(async () => {
+    const started = Date.now();
+    const snapshot = loadSocialSnapshot(CFG.bridge.socialV2);
+    if (snapshot.error) {
+      log(`✗ 读不到 social-v2：${snapshot.error}`);
+      return;
+    }
+    if (snapshot.sig) lastScannedSig = snapshot.sig;
+    await maybeRecycleSessions(snapshot.conversations);
+    if (!CFG.consolidate.enabled) {
+      log('记忆整理已由 config.consolidate.enabled=false 关闭；本轮只执行会话退役检查');
+      return;
+    }
+    const targets = targetItems(snapshot.items);
+    if (!targets.length) {
+      log('没有可整理的会话');
+      return;
+    }
+    for (const item of targets) {
+      const itemStarted = Date.now();
+      try {
+        let r;
+        try {
+          r = await consolidateConversation(item, snapshot.conversations);
+        } catch (error) {
+          if (!isDshConnectionError(error)) throw error;
+          // DSH 桌面版每次重启会换随机端口。当前批次已经在 pending 中，连接恢复后
+          // 原地重试一次不会丢消息；若再次失败则落入外层错误处理，等待下个轮询。
+          await reconnectDsh(error);
+          r = await consolidateConversation(item, snapshot.conversations);
+        }
+        recordConsolidationMetric(item, r, Date.now() - itemStarted);
+        if (r?.skipped) log(`- ${item.key} 跳过：${r.skipped}`);
+        if (r && r.ok === false) log(`✗ ${item.key}：${r.reason}`);
+      } catch (error) {
+        recordConsolidationMetric(item, { ok: false, reason: 'exception' }, Date.now() - itemStarted);
+        // 当前会话失效时只移除该会话绑定，不影响其他群的整理会话
+        if (/session|会话|not found|404/i.test(String(error?.message ?? error))) await dropSession(item.key);
+        log(`✗ ${item.key} 异常：${error?.message ?? error}`);
+      }
+    }
+    log(`本轮结束，用时 ${Date.now() - started}ms`);
+  });
 }
 
 // ── 入口 ────────────────────────────────────────────────────────────────────
@@ -673,7 +788,7 @@ let stopping = false;
 
 async function main() {
   log(
-    `memory-worker 启动（repo=${REPO}，data=${DATA}，poll=${CFG.worker.pollMs}ms，`
+    `memory-worker 启动（repo=${REPO}，data=${DATA}，poll=${CFG.worker.pollMs}ms，watch=${CFG.worker.watchScanMs}ms，`
     + `batch=${CFG.consolidate.minInformativeMessages}@quiet${Math.round(CFG.consolidate.quietMs / 60000)}m/`
     + `force${CFG.consolidate.forceMessages}/fallback${CFG.consolidate.lowActivityMinMessages}@${Math.round(CFG.consolidate.maxWaitMs / 3_600_000)}h）`
   );
@@ -686,6 +801,7 @@ async function main() {
     return;
   }
 
+  startSourceWatcher();
   // 首轮延迟 10 秒，之后固定间隔
   await new Promise((r) => setTimeout(r, 10_000));
   while (!stopping) {
@@ -706,6 +822,7 @@ async function main() {
 
 async function shutdown() {
   stopping = true;
+  stopSourceWatcher();
   try {
     streamAbort?.abort();
   } catch {}

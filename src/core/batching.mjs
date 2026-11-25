@@ -26,6 +26,20 @@ export function evaluatePendingTrigger(queue, config = {}, now = Date.now()) {
 
   const state = { pendingCount, minInformativeMessages, forceMessages, lowActivityMinMessages, quietMs, maxWaitMs, quietForMs, waitingForMs };
   if (!pendingCount) return { ...state, ready: false, trigger: '', reason: 'no-informative' };
+
+  const headAttempts = Number(pending[0]?.attempts) || 0;
+  const failCount = Number(queue?.failures?.count) || 0;
+  const lastFailAt = Number(queue?.failures?.lastAt) || 0;
+  const retryBaseMs = Math.max(0, positive(config.retryBaseMs, 5 * 60_000));
+  const retryMaxMs = Math.max(retryBaseMs, positive(config.retryMaxMs, 6 * 3_600_000));
+  if (headAttempts > 0 && failCount > 0 && lastFailAt > 0 && retryBaseMs > 0) {
+    const backoffMs = Math.min(retryMaxMs, retryBaseMs * (2 ** Math.max(0, failCount - 1)));
+    const elapsed = Math.max(0, now - lastFailAt);
+    if (elapsed < backoffMs) {
+      return { ...state, ready: false, trigger: '', reason: 'retry-backoff', retryAfterMs: backoffMs - elapsed };
+    }
+  }
+
   if (queue?.recovery?.pending === true) return { ...state, ready: true, trigger: 'recovery', reason: 'recovery' };
   if (pendingCount >= forceMessages) return { ...state, ready: true, trigger: 'force', reason: 'force' };
   if (pendingCount >= minInformativeMessages && quietForMs >= quietMs) return { ...state, ready: true, trigger: 'quiet', reason: 'quiet' };

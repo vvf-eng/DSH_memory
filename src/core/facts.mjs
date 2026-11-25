@@ -18,15 +18,22 @@ function atomicJson(file, value) {
   fs.renameSync(tmp, file);
 }
 
-export function normalizeFact(fact, { scope = 'global', groupId = '' } = {}) {
+export function normalizeFact(fact, { scope = 'global', groupId = '', userId = '' } = {}) {
   const scopeRef = fact?.scopeRef && typeof fact.scopeRef === 'object' ? fact.scopeRef : null;
   const sourceRef = fact?.sourceRef && typeof fact.sourceRef === 'object' ? fact.sourceRef : null;
   const lifecycle = fact?.lifecycle && typeof fact.lifecycle === 'object' ? fact.lifecycle : null;
   const resolvedScope = String(scopeRef?.kind ?? fact?.scope ?? scope);
   const resolvedGroup = String(scopeRef?.groupId ?? groupId ?? '');
+  const resolvedUser = String(scopeRef?.userId ?? userId ?? '');
   const createdAt = String(fact?.createdAt ?? fact?.date ?? '');
   let source = String(fact?.source ?? '');
   if (!source && sourceRef?.kind === 'group') source = `group:${sourceRef.groupId ?? resolvedGroup}${sourceRef.seq ? `#seq${sourceRef.seq}` : ''}`;
+  if (!source && sourceRef?.kind === 'private') source = `private:${sourceRef.userId ?? resolvedUser}${sourceRef.seq ? `#seq${sourceRef.seq}` : ''}`;
+  const defaultScopeRef = resolvedScope === 'group'
+    ? { kind: 'group', groupId: resolvedGroup }
+    : resolvedScope === 'private'
+      ? { kind: 'private', ...(resolvedUser ? { userId: resolvedUser } : {}) }
+      : { kind: resolvedScope };
   return {
     ...fact,
     id: String(fact?.id ?? ''),
@@ -36,7 +43,7 @@ export function normalizeFact(fact, { scope = 'global', groupId = '' } = {}) {
     source,
     sourceRef: sourceRef ?? null,
     scope: resolvedScope,
-    scopeRef: scopeRef ?? { kind: resolvedScope, ...(resolvedScope === 'group' ? { groupId: resolvedGroup } : {}) },
+    scopeRef: scopeRef ?? defaultScopeRef,
     confidence: Number.isFinite(Number(fact?.confidence)) ? Number(fact.confidence) : 0.7,
     status: String(fact?.status ?? 'active'),
     expiresAt: String(lifecycle?.expiresAt ?? fact?.expiresAt ?? ''),
@@ -47,11 +54,15 @@ export function normalizeFact(fact, { scope = 'global', groupId = '' } = {}) {
 export function normalizeMemberFacts(member) {
   if (!member || typeof member !== 'object') return member;
   const out = structuredClone(member);
+  const uid = String(out.qq ?? '');
   out.global = out.global ?? { tags: [], traits: [], avoid: [], facts: [] };
-  out.global.facts = (Array.isArray(out.global.facts) ? out.global.facts : []).map((fact) => normalizeFact(fact, { scope: 'global' }));
+  out.global.facts = (Array.isArray(out.global.facts) ? out.global.facts : []).map((fact) => normalizeFact(fact, { scope: 'global', userId: uid }));
+  if (out.private && typeof out.private === 'object') {
+    out.private.facts = (Array.isArray(out.private.facts) ? out.private.facts : []).map((fact) => normalizeFact(fact, { scope: 'private', userId: uid }));
+  }
   out.groups = out.groups ?? {};
   for (const [gid, group] of Object.entries(out.groups)) {
-    group.facts = (Array.isArray(group?.facts) ? group.facts : []).map((fact) => normalizeFact(fact, { scope: 'group', groupId: gid }));
+    group.facts = (Array.isArray(group?.facts) ? group.facts : []).map((fact) => normalizeFact(fact, { scope: 'group', groupId: gid, userId: uid }));
   }
   return out;
 }
@@ -62,19 +73,30 @@ export function legacyWriteEnabled(memDir, now = Date.now()) {
   return now < (Number(state.legacyWriteUntil) || 0);
 }
 
-export function createFactRecord({ memDir, schema = 3, id, text, scope, groupId = '', sourceSeq = 0, confidence = 0.7, now = Date.now(), expiresAt = '', supersededBy = '' }) {
+export function createFactRecord({ memDir, schema = 3, id, text, scope, groupId = '', userId = '', sourceSeq = 0, confidence = 0.7, now = Date.now(), expiresAt = '', supersededBy = '' }) {
   const date = day(now);
-  const source = sourceSeq ? `group:${groupId}#seq${sourceSeq}` : groupId ? `group:${groupId}` : '';
+  const isPrivate = scope === 'private' || (!groupId && Boolean(userId));
+  const source = isPrivate
+    ? (sourceSeq ? `private:${userId}#seq${sourceSeq}` : userId ? `private:${userId}` : 'private')
+    : (sourceSeq ? `group:${groupId}#seq${sourceSeq}` : groupId ? `group:${groupId}` : '');
   if (Number(schema) < 3) {
     return { id, text, date, source, scope, confidence, status: 'active', ...(expiresAt ? { expiresAt } : {}), ...(supersededBy ? { supersededBy } : {}) };
   }
+  const sourceRef = isPrivate
+    ? { kind: 'private', ...(userId ? { userId: String(userId) } : {}), ...(sourceSeq ? { seq: sourceSeq } : {}) }
+    : { kind: 'group', groupId: String(groupId), ...(sourceSeq ? { seq: sourceSeq } : {}) };
+  const scopeRef = scope === 'group'
+    ? { kind: 'group', groupId: String(groupId) }
+    : scope === 'private'
+      ? { kind: 'private', ...(userId ? { userId: String(userId) } : {}) }
+      : { kind: scope };
   const record = {
     id,
     text,
     createdAt: new Date(now).toISOString(),
     updatedAt: new Date(now).toISOString(),
-    sourceRef: { kind: 'group', groupId: String(groupId), ...(sourceSeq ? { seq: sourceSeq } : {}) },
-    scopeRef: { kind: scope, ...(scope === 'group' ? { groupId: String(groupId) } : {}) },
+    sourceRef,
+    scopeRef,
     confidence,
     status: 'active',
     expiresAt: String(expiresAt || ''),
@@ -119,11 +141,15 @@ export function migrateMembersToSchema3({ memDir, dry = false, observationDays =
     next.schema = 3;
     next.factSchema = 3;
     next.migratedAt = new Date(now).toISOString();
+    const uid = String(next.qq ?? path.basename(name, '.json'));
     next.global = next.global ?? { tags: [], traits: [], avoid: [], facts: [] };
-    next.global.facts = (Array.isArray(next.global.facts) ? next.global.facts : []).map((fact) => toSchema3Fact(fact, { scope: 'global' }, now));
+    next.global.facts = (Array.isArray(next.global.facts) ? next.global.facts : []).map((fact) => toSchema3Fact(fact, { scope: 'global', userId: uid }, now));
+    if (next.private && typeof next.private === 'object') {
+      next.private.facts = (Array.isArray(next.private.facts) ? next.private.facts : []).map((fact) => toSchema3Fact(fact, { scope: 'private', userId: uid }, now));
+    }
     next.groups = next.groups ?? {};
     for (const [gid, group] of Object.entries(next.groups)) {
-      group.facts = (Array.isArray(group?.facts) ? group.facts : []).map((fact) => toSchema3Fact(fact, { scope: 'group', groupId: gid }, now));
+      group.facts = (Array.isArray(group?.facts) ? group.facts : []).map((fact) => toSchema3Fact(fact, { scope: 'group', groupId: gid, userId: uid }, now));
     }
     report.migrated += 1;
     report.files.push(name);

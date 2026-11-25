@@ -7,12 +7,12 @@
 
 ## 功能
 
-- 群聊和私聊按会话作用域隔离，先过滤后检索；
-- 人物、关系、群规、历史事件等问题按需召回，普通闲聊不重复注入整库；
-- 每会话可靠 pending 队列，消息滚出 QQbridge 窗口后仍可继续整理；
-- 30 条安静批处理、100 条强制批处理和低活跃 12 小时兜底；
-- JSON Schema 补丁、本地来源校验、事务写入、审计和整批回滚；
-- 事实过期/替换、近重复去重、匿名指标和整理会话预算；
+- 群聊和私聊按会话作用域隔离（含独立 `private` 作用域与分群动态人设），先过滤后检索；
+- 人物、旧称、多轮指代、泛群反查、关系、群规、历史事件等问题按需召回（Node 原生中文分词 + IDF 加权）；
+- 每会话可靠 pending 队列、高频文件变更轻量扫描防断档、失败指数退避与死信隔离；
+- 30 条安静批处理、100 条强制批处理、低活跃 12 小时兜底与 Prompt 字符预算精确对齐；
+- JSON Schema 补丁、本人发言来源校验、旧事实更新/淘汰闭环、独立游标事务与逻辑回滚兜底；
+- 事实过期/替换、智能容量淘汰、近重复去重、匿名指标、按会话隔离的整理会话池与历史快照 GC；
 - DSH 安装/卸载、初始化、诊断和离线测试。
 
 ## 架构
@@ -174,7 +174,7 @@ node memory.mjs metrics --days 1
 node memory.mjs context --key group:1234567890 --query "上次发生了什么" --intent timeline
 ```
 
-离线测试不需要真实 QQ、QQbridge 或 DSH。当前发布基线为 `106/106`。
+离线测试不需要真实 QQ、QQbridge 或 DSH。当前发布基线为 `138/138`。
 
 ## 常用命令
 
@@ -188,6 +188,7 @@ node memory.mjs audit [--limit 15]
 node memory.mjs rollback latest
 node memory.mjs transactions [--recover]
 node memory.mjs dedupe --dry
+node memory.mjs gc [--days 30] [--keep 20] [--dry]
 node memory.mjs metrics --days 7
 ```
 

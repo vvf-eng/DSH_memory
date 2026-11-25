@@ -99,12 +99,18 @@ export function loadMemoryConfig(memDir) {
         return Number.isFinite(env) && env >= 0 ? env : Number.isFinite(configured) && configured >= 0 ? configured : 43_200_000;
       })(),
       maxMessages: clamp(file.consolidate?.maxMessages, 30, 400, 150),
+      promptMaxChars: clamp(file.consolidate?.promptMaxChars, 1500, 24000, 6000),
+      includePrivate: file.consolidate?.includePrivate !== false,
+      retryBaseMs: clamp(file.consolidate?.retryBaseMs, 0, 3_600_000, 300_000),
+      retryMaxMs: clamp(file.consolidate?.retryMaxMs, 60_000, 86_400_000, 21_600_000),
+      maxBatchAttempts: clamp(file.consolidate?.maxBatchAttempts, 1, 20, 5),
       preset: String(file.consolidate?.preset ?? ''),
       workspaceTitle: String(file.consolidate?.workspaceTitle ?? 'QQ 记忆整理'),
       timeoutMs: clamp(file.consolidate?.timeoutMs, 30_000, 600_000, 180_000)
     },
     worker: {
       pollMs: Math.max(60_000, Number(file.worker?.pollMs) || 300_000),
+      watchScanMs: clamp(file.worker?.watchScanMs, 5_000, 300_000, 30_000),
       dshClientPath,
       provider: String(file.worker?.provider ?? 'deepseek-official'),
       model: String(file.worker?.model ?? 'deepseek-flash'),

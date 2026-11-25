@@ -18,9 +18,9 @@ import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { buildContext, extractBootBlock, loadMembers, readJsonFile, readTextFile } from './core/context.mjs';
-import { readCursor, listAudits, readAudit, rollbackAudit, dedupeMemberFacts } from './core/consolidate.mjs';
+import { readCursor, listAudits, readAudit, rollbackAudit, dedupeMemberFacts, bumpMemoryVersion, pruneStateHistory } from './core/consolidate.mjs';
 import { readMetrics, summarizeMetrics } from './core/metrics.mjs';
-import { readPendingQueue } from './core/pending.mjs';
+import { readDeadLetters, readPendingQueue } from './core/pending.mjs';
 import { evaluatePendingTrigger } from './core/batching.mjs';
 import { listTransactions, recoverPreparedTransactions } from './core/transaction.mjs';
 import { createFactRecord, migrateMembersToSchema3 } from './core/facts.mjs';
@@ -763,6 +763,7 @@ function parseFlags(argv) {
     else if (a === '--confidence') flags.confidence = argv[++i];
     else if (a === '--threshold') flags.threshold = argv[++i];
     else if (a === '--days') flags.days = argv[++i];
+    else if (a === '--keep') flags.keep = argv[++i];
     else if (a === '--observation-days') flags.observationDays = argv[++i];
     else if (a === '--limit') flags.limit = argv[++i];
     else rest.push(a);
@@ -794,10 +795,12 @@ function cmdPending(key = '') {
       return out;
     }, {});
     const oldest = queue.pending.length ? Math.min(...queue.pending.map((item) => Number(item.enqueuedAt) || Date.now())) : 0;
+    const deadLetters = readDeadLetters(MEM_ROOT, queue.key).length;
     console.log(
       `${queue.key}  gen=${queue.generation} scan=${queue.scan.seq} pending=${queue.pending.length}`
       + `（normal=${levels.normal ?? 0}, important=${levels.important ?? 0}）`
       + ` inflight=${queue.inflight?.batchId ?? '-'} failures=${queue.failures.count}`
+      + `${deadLetters ? ` quarantined=${queue.stats?.quarantined ?? deadLetters}(batches=${deadLetters})` : ''}`
       + ` next=${decision.ready ? decision.trigger : decision.reason}`
       + `${oldest ? ` oldest=${Math.round((Date.now() - oldest) / 60000)}m` : ''}`
     );
@@ -844,6 +847,20 @@ function cmdToolUsage({ apply = false, days = 30 } = {}) {
   }
 }
 
+function cmdGc({ days = 30, keep = 20, dry = false } = {}) {
+  const res = pruneStateHistory({
+    memDir: MEM_ROOT,
+    days: Math.max(1, Number(days) || 30),
+    keepLatest: Math.max(1, Number(keep) || 20),
+    dry: Boolean(dry)
+  });
+  const kb = (res.bytesFreed / 1024).toFixed(1);
+  console.log(
+    `状态清理（保留近 ${Math.max(1, Number(days) || 30)} 天及最新 ${Math.max(1, Number(keep) || 20)} 条${dry ? '，--dry 预览' : ''}）：`
+    + `备份 -${res.backupsRemoved}，已完成事务 -${res.transactionsRemoved}，审计快照压缩 ${res.auditsCompacted}，释放 ${kb} KB`
+  );
+}
+
 const HELP = `记忆库工具 v0.11.4
 
   node memory.mjs init
@@ -860,6 +877,7 @@ const HELP = `记忆库工具 v0.11.4
   node memory.mjs rollback [审计ID|latest]
   node memory.mjs transactions [--recover]
   node memory.mjs dedupe [--threshold 0.8] [--dry]
+  node memory.mjs gc [--days 30] [--keep 20] [--dry]
   node memory.mjs member:list
   node memory.mjs member:add <QQ> <群名片> [--force]
   node memory.mjs member:fact <QQ> "<事实>" [--scope group|global] [--group 群号] [--source 来源] [--confidence 0.9]
@@ -887,6 +905,7 @@ async function main() {
   if (cmd === 'rollback') return cmdRollback(rest[1]);
   if (cmd === 'transactions') return cmdTransactions({ recover: Boolean(flags.recover) });
   if (cmd === 'dedupe') return cmdDedupe({ threshold: flags.threshold, dry: Boolean(flags.dry) });
+  if (cmd === 'gc') return cmdGc({ days: flags.days, keep: flags.keep, dry: Boolean(flags.dry) });
   if (cmd === 'member:list') return cmdMemberList();
   if (cmd === 'member:add') return cmdMemberAdd(rest[1], rest[2], flags);
   if (cmd === 'member:fact') return cmdMemberFact(rest[1], rest[2], flags);
